@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>madhousearcade</title>
+<style>
+  :root {
+      color-scheme: dark;
+
+      /* The hover growth, and the only animation on this page.
+         The picture itself is not animated at all: it is swapped. A crossfade
+         was tried and taken back out - see the note above `.cover` for what it
+         cost and why a cut is better here than a blend. */
+      --grow: 300ms;
+      --ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+      --page: #08080e;
+      --card: #101018;
+      --edge: #22222f;
+      --edge-lit: #3f3f58;
+      --accent: #e0a33c;
+      --text: #6a6a80;
+      --label: #8a8aa4;
+      --bright: #f0f0f6;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+      margin: 0; min-height: 100vh; padding: clamp(24px, 5vw, 40px) 20px 32px;
+      background-color: var(--page);
+      background-image:
+          radial-gradient(760px 420px at 50% -60px,
+              rgba(120, 120, 190, 0.16), transparent 70%);
+      background-repeat: no-repeat;
+      color: var(--text);
+      font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+      display: flex; flex-direction: column; align-items: center;
+      gap: clamp(22px, 4vw, 32px);
+  }
+
+  header { text-align: center; }
+
+  /* The trailing letter-space belongs to no letter, so the glyphs sit half of
+     it left of centre until the box gives it back. */
+  h1 { margin: 0 -0.28em 0 0; font-size: clamp(15px, 3.4vw, 21px);
+       font-weight: 600; letter-spacing: 0.28em; text-transform: uppercase;
+       color: var(--bright); }
+
+  header::after {
+      content: ""; display: block; height: 1px; width: min(300px, 62vw);
+      margin: 16px auto 0;
+      background: linear-gradient(90deg,
+          transparent, var(--edge-lit), transparent);
+  }
+
+  /* One shape for every card, because the console is square and so is every
+     cover. `auto-fit` rather than a column count: the menu is a listing of a
+     directory, so the page cannot know how many games it is laying out. */
+  ul { list-style: none; margin: 0; padding: 0;
+       width: 100%; max-width: 900px;
+       display: grid; gap: clamp(12px, 2vw, 20px);
+       grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); }
+
+  .card {
+      display: block; position: relative; overflow: hidden;
+      text-decoration: none;
+      background-color: var(--card);
+      border-radius: 14px;
+      transition: transform var(--grow) var(--ease),
+                  box-shadow var(--grow) var(--ease);
+  }
+
+  /* Square whatever arrives. The width and height attributes already say 800 by
+     800, but the same element also shows a 240 by 240 clip, and a card that
+     changed size on hover would move every card after it. */
+  .cover { display: block; width: 100%; height: auto; aspect-ratio: 1 / 1;
+           object-fit: cover; }
+
+  /* Only while the clip is showing. The cover is 800 by 800 artwork drawn for a
+     card this size and wants the browser's smoothing; the clip is a 240 pixel
+     console frame scaled up to the same box and wants none of it.
+
+     THE PICTURE IS CUT, NOT BLENDED, and that is the second thing tried rather
+     than the first. A 150 ms crossfade went in first, on the reasoning that a
+     hand-drawn cover and a gameplay frame are different enough that a hard
+     switch reads as a glitch. It cost three things and bought less than it
+     cost. It needed the cover painted a second time as the card's background,
+     since one `<img>` holds one picture - and the card is rounded and clips
+     with `overflow: hidden`, so the image on top and the background behind it
+     are two separately antialiased clips of one curve, which do not agree, so a
+     light fringe of cover traced the corner for as long as the clip played.
+     Timing the blend against the growth then had to be got right twice, and
+     smoothing the clip through the movement to stop nearest-neighbour
+     resampling shimmering against it did not help either.
+
+     A cut needs none of that: one element, one layer, one picture at a time,
+     nothing behind anything. The only thing animated on this page is the size,
+     and the only thing that changes about the picture is which one it is. */
+  .cover.playing { image-rendering: pixelated; }
+
+  /* Nothing happens unless a pointer can actually hover, so a tap does not
+     leave a card stuck in its hover state.
+
+     It grows rather than lifting, and the difference is not cosmetic. A uniform
+     scale about the centre keeps every point that was inside the card inside
+     it, so a stationary pointer cannot fall out of the element it is hovering -
+     where a translation slides the edge past the pointer, fires `mouseleave`,
+     and restarts the clip. The growth is also small enough to stay inside the
+     grid gap, so no card ever covers its neighbour. */
+  @media (hover: hover) {
+      .card:hover { transform: scale(1.035); z-index: 1;
+                    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55); }
+  }
+
+  .card:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+  @media (prefers-reduced-motion: reduce) {
+      :root { --grow: 1ms; }
+      .card { transition: none; }
+      .card:hover { transform: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Generated by cmake/Website.cmake from the games this tree builds: one entry
+     per game, and no per-game text beyond the title, because a tagline here
+     would be a third place a game's identity is spelled after the module and
+     MODULES.md. What a game says about itself here is its cover and its clip. -->
+
+<header>
+  <h1>madhousearcade</h1>
+</header>
+
+<ul>
+  <li><a class="card" href="player.html?module=games/asteroids/asteroids.wasm">
+    <img class="cover" src="games/asteroids/cover.png" alt="Asteroids" width="800" height="800" data-clip="games/asteroids/clip.png">
+  </a></li>
+  <li><a class="card" href="player.html?module=games/drop-four/drop-four.wasm">
+    <img class="cover" src="games/drop-four/cover.png" alt="Drop Four" width="800" height="800" data-clip="games/drop-four/clip.png">
+  </a></li>
+  <li><a class="card" href="player.html?module=games/example/example.wasm">
+    <img class="cover" src="games/example/cover.png" alt="Example" width="800" height="800" data-clip="games/example/clip.png">
+  </a></li>
+  <li><a class="card" href="player.html?module=games/klondike/klondike.wasm">
+    <img class="cover" src="games/klondike/cover.png" alt="Klondike" width="800" height="800" data-clip="games/klondike/clip.png">
+  </a></li>
+  <li><a class="card" href="player.html?module=games/minesweeper/minesweeper.wasm">
+    <img class="cover" src="games/minesweeper/cover.png" alt="Minesweeper" width="800" height="800" data-clip="games/minesweeper/clip.png">
+  </a></li>
+  <li><a class="card" href="player.html?module=games/pong/pong.wasm">
+    <img class="cover" src="games/pong/cover.png" alt="Pong" width="800" height="800" data-clip="games/pong/clip.png">
+  </a></li>
+  <li><a class="card" href="player.html?module=games/scorched-earth/scorched-earth.wasm">
+    <img class="cover" src="games/scorched-earth/cover.png" alt="Scorched Earth" width="800" height="800" data-clip="games/scorched-earth/clip.png">
+  </a></li>
+  <li><a class="card" href="player.html?module=games/snake/snake.wasm">
+    <img class="cover" src="games/snake/cover.png" alt="Snake" width="800" height="800" data-clip="games/snake/clip.png">
+  </a></li>
+  <li><a class="card" href="player.html?module=games/suika/suika.wasm">
+    <img class="cover" src="games/suika/cover.png" alt="Suika" width="800" height="800" data-clip="games/suika/clip.png">
+  </a></li>
+</ul>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Hover plays the game.
+//
+// A card is a real `<a href>` and stays one: the click is never intercepted and
+// nothing here navigates. User activation propagates across a navigation a
+// gesture initiated, so a game reached by clicking a link starts with its audio
+// context already running, while the same destination reached by assigning
+// `location.href` stays suspended with a `resume()` that never settles. See the
+// browser section of docs/decisions.md.
+//
+// So the whole of this script is one picture swapped for another. With it
+// switched off the page is six covers that link to six games, which is the
+// page's job; the clips are the part that needs a script, and they are the part
+// that can be missing.
+// ---------------------------------------------------------------------------
+
+// A pointer that cannot hover gets none of it, and the media query above says
+// the same thing about the styles. Gating only the styles would not be enough:
+// a touch browser synthesises a mouse enter on tap, so the first tap would swap
+// in a clip for the moment before the game loaded over it.
+if (matchMedia ("(hover: hover)").matches) {
+    const armed = [];
+
+    for (const image of document.querySelectorAll (".card .cover")) {
+        const showCover = arm (image);
+
+        if (showCover) { armed.push (showCover); }
+    }
+
+    restoreOnLeaving (armed);
+}
+
+function arm (image) {
+    const cover = image.getAttribute ("src");
+    const clip = image.dataset.clip;
+
+    if (! clip) { return null; }
+
+    // Every way out of `playing` is this, which is why it is one function: the
+    // hover ending, the clip failing to load, and the page going away.
+    const showCover = () => {
+        image.classList.remove ("playing");
+        image.src = cover;
+    };
+
+    image.addEventListener ("mouseenter", () => {
+        // Assigning `src` is what plays the animation from frame zero, and what
+        // fetches it at all - until the first hover this page has asked for its
+        // covers and nothing else.
+        image.classList.add ("playing");
+        image.src = clip;
+    });
+
+    image.addEventListener ("mouseleave", showCover);
+
+    // A clip that 404s, or that is not a picture, would otherwise leave a card
+    // showing nothing at all. Going back to the cover costs the hover and keeps
+    // the page. The guard is what stops a cover that is itself broken from
+    // reassigning `src` to the thing that just failed, for ever.
+    image.addEventListener ("error", () => {
+        if (image.getAttribute ("src") === cover) { return; }
+
+        showCover ();
+    });
+
+    return showCover;
+}
+
+// A NAVIGATION IS NOT A `mouseleave`. Click a card, play the game, press Back:
+// that card is still playing, because the pointer left it by the page going
+// away rather than by moving, and the restored page has no hover tracking to
+// deliver the event with. It arrives only when some other card's `mouseenter`
+// finally does - so the stale clip survives until the reader hovers something
+// else, which is exactly how it was reported.
+//
+// So the state is shed when the page stops being in front rather than waited
+// for. That is a choice and not a restoration, since the pointer may genuinely
+// still be over that card, and it is the right one because the page cannot know
+// where the pointer is until it moves: a cover that becomes a clip on the first
+// movement is recoverable, where a clip nobody asked for is not.
+//
+// `pagehide` is the early one - it runs before the browser snapshots the page,
+// so the DOM that comes back is already right, and it is also what runs on a
+// real unload. `pageshow` is the certain one, because it sees the DOM as it
+// actually came back rather than as it was left; it is gated on `persisted`
+// because a page that has just loaded has every card on its cover already, and
+// reassigning `src` to the picture it is displaying is a line that does nothing
+// and costs a reader the question of what it is for.
+//
+// `visibilitychange` is deliberately not here, and that is a real difference
+// from the player rather than an oversight - `player.html` listens for it
+// because a game left running is a simulation that must stop. Nothing here is
+// running: the clip is animated by the browser, which does not paint a hidden
+// tab. And a tab switched away from keeps the browser's own hover tracking
+// intact, so the card that is playing is the card the pointer is on, and moving
+// the pointer to another window ends the hover the ordinary way. Shedding there
+// would take a clip away from a reader still hovering it, to fix nothing.
+
+function restoreOnLeaving (armed) {
+    const showCovers = () => {
+        for (const showCover of armed) { showCover (); }
+    };
+
+    addEventListener ("pagehide", showCovers);
+
+    addEventListener ("pageshow", event => {
+        if (event.persisted) { showCovers (); }
+    });
+}
+</script>
+
+</body>
+</html>
