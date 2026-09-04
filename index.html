@@ -42,11 +42,19 @@
 
   header { text-align: center; }
 
-  /* The trailing letter-space belongs to no letter, so the glyphs sit half of
-     it left of centre until the box gives it back. */
-  h1 { margin: 0 -0.28em 0 0; font-size: clamp(15px, 3.4vw, 21px);
-       font-weight: 600; letter-spacing: 0.28em; text-transform: uppercase;
-       color: var(--bright); }
+  /* The wordmark, which replaced a line of letter-spaced type. The `h1` is kept
+     and emptied of text rather than dropped: the picture carries the name now,
+     so the accessible name is the image's `alt`, and a page whose only heading
+     became a decorative image would have no outline at all.
+
+     Sized against the viewport rather than at its natural size. The file is a
+     1024x192 viewBox with the lettering inset to 33..986 by 34..164, so it
+     brings its own margin and needs none here; `height: auto` takes the ratio
+     from the viewBox, which is what stops the header reflowing as the picture
+     lands. The cap is below the 900px the grid is bounded at, so the logo is
+     never wider than the cards beneath it. */
+  h1 { margin: 0; }
+  h1 img { display: block; width: min(560px, 82vw); height: auto; }
 
   header::after {
       content: ""; display: block; height: 1px; width: min(300px, 62vw);
@@ -116,6 +124,28 @@
 
   .card:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 
+  /* A GAME THAT IS NOT ON THE ARCADE, which is markup only the local preview
+     ever carries: cmake/Website.cmake writes the class and the plate when it
+     assembles `<build>/products/website/preview`, and writes neither into the
+     deployable, where every card is a game that is there on purpose.
+
+     Loud rather than subtle, and that is the whole point of it. The failure
+     this prevents is reading the local menu as if it were the public site -
+     which is how a half-finished game ends up shipped - so the cover is dimmed
+     and a plate says what is true, rather than a small corner dot somebody
+     stops seeing on the second day. */
+  .card.unlisted .cover { opacity: 0.5; filter: saturate(0.35); }
+
+  .card.unlisted .mark {
+      position: absolute; left: 0; right: 0; bottom: 0;
+      padding: 8px 10px;
+      background: rgba(8, 8, 14, 0.86);
+      border-top: 1px solid var(--edge-lit);
+      color: var(--accent);
+      font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+      text-align: center;
+  }
+
   @media (prefers-reduced-motion: reduce) {
       :root { --grow: 1ms; }
       .card { transition: none; }
@@ -131,36 +161,12 @@
      MODULES.md. What a game says about itself here is its cover and its clip. -->
 
 <header>
-  <h1>madhousearcade</h1>
+  <h1><img src="logo.svg" alt="madhousearcade" width="1024" height="192"></h1>
 </header>
 
 <ul>
-  <li><a class="card" href="player.html?module=games/asteroids/asteroids.wasm">
-    <img class="cover" src="games/asteroids/cover.png" alt="Asteroids" width="800" height="800" data-clip="games/asteroids/clip.png">
-  </a></li>
-  <li><a class="card" href="player.html?module=games/drop-four/drop-four.wasm">
-    <img class="cover" src="games/drop-four/cover.png" alt="Drop Four" width="800" height="800" data-clip="games/drop-four/clip.png">
-  </a></li>
-  <li><a class="card" href="player.html?module=games/example/example.wasm">
-    <img class="cover" src="games/example/cover.png" alt="Example" width="800" height="800" data-clip="games/example/clip.png">
-  </a></li>
-  <li><a class="card" href="player.html?module=games/klondike/klondike.wasm">
-    <img class="cover" src="games/klondike/cover.png" alt="Klondike" width="800" height="800" data-clip="games/klondike/clip.png">
-  </a></li>
   <li><a class="card" href="player.html?module=games/minesweeper/minesweeper.wasm">
     <img class="cover" src="games/minesweeper/cover.png" alt="Minesweeper" width="800" height="800" data-clip="games/minesweeper/clip.png">
-  </a></li>
-  <li><a class="card" href="player.html?module=games/pong/pong.wasm">
-    <img class="cover" src="games/pong/cover.png" alt="Pong" width="800" height="800" data-clip="games/pong/clip.png">
-  </a></li>
-  <li><a class="card" href="player.html?module=games/scorched-earth/scorched-earth.wasm">
-    <img class="cover" src="games/scorched-earth/cover.png" alt="Scorched Earth" width="800" height="800" data-clip="games/scorched-earth/clip.png">
-  </a></li>
-  <li><a class="card" href="player.html?module=games/snake/snake.wasm">
-    <img class="cover" src="games/snake/cover.png" alt="Snake" width="800" height="800" data-clip="games/snake/clip.png">
-  </a></li>
-  <li><a class="card" href="player.html?module=games/suika/suika.wasm">
-    <img class="cover" src="games/suika/cover.png" alt="Suika" width="800" height="800" data-clip="games/suika/clip.png">
   </a></li>
 </ul>
 

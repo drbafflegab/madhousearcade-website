@@ -4712,6 +4712,51 @@ const MIN_SCALE = 1;
 // console pixel and some columns were already a device pixel wider than their
 // neighbours. The rule reads as inviolable and has been approximate on that
 // display for as long as it has been written down.
+//
+// AND IT IS NO LONGER UNCONDITIONAL, which is the fourth pass and the one that
+// gave something up on purpose. What a whole multiple costs is the remainder,
+// and on a phone the remainder is most of what a phone has: the window is 240
+// times four-and-a-fraction, so the fraction is a big share of a small screen
+// and there is no second window to move to. The readings that decided it, each
+// device's own viewport through this function - waste is what the whole
+// multiple leaves unused, uneven is how much wider a console pixel is than its
+// neighbour once the remainder is spent instead:
+//
+//     iPhone SE          375 css   whole 360    waste  4%   uneven 33%
+//     iPhone 15 / 16     393 css   whole 320    waste 19%   uneven 25%
+//     iPhone 15 Pro Max  430 css   whole 400    waste  7%   uneven 20%
+//     iPad mini          744 css   whole 720    waste  3%   uneven 17%
+//     iPad 10.9          820 css   whole 720    waste 12%   uneven 17%
+//     1x desktop        1000 css   whole 480    waste 27%   uneven 50%
+//
+// So the fit fills the span exactly - a fractional scale, and console pixels a
+// device pixel apart in width - unless a device pixel is one somebody can see,
+// where it takes the whole multiple under it as it always did. That is the
+// whole rule, and the threshold in it is a physical claim rather than a taste:
+// at 2x and 3x the odd column is a twentieth of a millimetre wider than the one
+// beside it, and at 1x it is a whole monitor pixel, which is the 50% row above
+// and is the ordinary way to visit a site.
+//
+// `ratio / zoom` rather than the ratio alone, because `devicePixelRatio` counts
+// the browser's zoom into itself: a 1x monitor at 200% reports 2 and is still a
+// 1x monitor.
+//
+// TWO REJECTED SHAPES, because both are the obvious one from somewhere.
+//
+// A threshold on DENSITY IN CONSOLE PIXELS - fill where there are enough device
+// pixels per console pixel to hide the difference - is exactly backwards, and
+// it is the intuitive rule: that density is LOWEST on the small screens, 4.9 on
+// an iPhone against 8.5 on an iPad Pro, so it would have filled the screens
+// with room to spare and snapped the ones without.
+//
+// And a SECOND CONDITION ON THE WASTE, filling only where the whole multiple
+// leaves at least a twentieth of the span, was written and then taken out. It
+// is defensible - it spares the iPhone SE a trade of the worst unevenness on
+// the list for 15 css px - but it buys that on two devices at the price of a
+// threshold, a constant and a branch in every case that reads this, and the
+// rule stops being a sentence.
+const FILL_DENSITY = 2;
+
 function canvasScale (available, ratio, zoom) {
     const dpr = ratio > 0 ? ratio : 1;
 
@@ -4725,19 +4770,33 @@ function canvasScale (available, ratio, zoom) {
     // page measures its own chrome, so a narrow window can report a negative
     // span, and layout before the first paint can report none at all.
     const fits = (span, limit) =>
-        Number.isFinite (span) ? Math.floor (span * dpr * page / limit) : 0;
+        Number.isFinite (span) ? span * dpr * page / limit : 0;
 
-    const scale = Math.max (MIN_SCALE, Math.min (
+    // The fit the span would take if it could be fractional, and the whole
+    // multiple under it. The floor comes after the minimum rather than inside
+    // `fits` because it is the CHOSEN dimension that has to be floored - the
+    // other one has room to spare by definition.
+    const exact = Math.max (MIN_SCALE, Math.min (
         fits (available.width, FRAME_WIDTH),
         fits (available.height, FRAME_HEIGHT)));
 
-    // Exact by construction: the CSS box times the ratio is `240 * scale`, a
-    // whole number of device pixels, so every console pixel is a square block
-    // of them. The division can still be fractional in CSS - a ratio of 2.25
-    // makes it 106.67px - and a box of whole device pixels is only on the grid
-    // it was sized for if it also STARTS on one, which is what `gridSnap` below
-    // reads back and corrects. This function has no way to know: where the page
-    // puts the box is the page's arithmetic and not this one's.
+    const whole = Math.max (MIN_SCALE, Math.floor (exact));
+
+    const scale = dpr / page >= FILL_DENSITY ? exact : whole;
+
+    // Exact by construction WHERE THE SCALE IS WHOLE: the CSS box times the
+    // ratio is `240 * scale`, a whole number of device pixels, so every console
+    // pixel is a square block of them. The division can still be fractional in
+    // CSS - a ratio of 2.25 makes it 106.67px - and a box of whole device
+    // pixels is only on the grid it was sized for if it also STARTS on one,
+    // which is what `gridSnap` below reads back and corrects. This function has
+    // no way to know: where the page puts the box is the page's arithmetic and
+    // not this one's.
+    //
+    // Where the scale is fractional the box is the span itself and the grid is
+    // what was traded away, so `gridSnap` has nothing left to correct there -
+    // it still runs, and moves the box by under half a device pixel, which is
+    // smaller than the difference it is no longer able to remove.
     return {
         scale,
         width: FRAME_WIDTH * scale / dpr,
@@ -4782,9 +4841,53 @@ function gridSnap (position, ratio) {
     return (Math.round (device) - device) / dpr;
 }
 
+// How far the page is zoomed, as the factor that turns a CSS pixel back into
+// the one it would be at 100%, given one reading of the window.
+//
+// `outerWidth` is the window in screen coordinates and page zoom does not move
+// it, where `innerWidth` is CSS pixels and does - so the two divide to exactly
+// the zoom. Width rather than height because the browser's own chrome is above
+// the page rather than beside it: `outerHeight` carries a tab strip and an
+// address bar that `outerWidth` does not, and a docked console takes
+// `innerHeight` without touching outer at all.
+//
+// ALL OF WHICH ASSUMES THE OUTER PAIR IS A WINDOW, and on a phone it is the
+// SCREEN. Measured on an iPhone, through this page, by rotating it:
+//
+//     portrait    inner 390x699    outer 390x844
+//     landscape   inner 750x284    outer 390x844
+//
+// The outer pair does not turn over, because the device has one screen and it
+// has one size. Portrait survives that by luck - 390/390 is 1, which is the
+// right answer - and landscape reads 390/750 = 0.52, so the page concluded the
+// player had zoomed the browser out to half and divided it back out of the fit,
+// drawing a 125 css px canvas where 240 fits. That is the whole of the "the
+// zoom is weird after rotating" report.
+//
+// So the reading is refused when the two pairs disagree about which way up the
+// window is, because a window's chrome adds to it and cannot turn it over: a
+// portrait outer around a landscape inner is not this window at all, and a
+// phone that has no page zoom in the first place is right to answer 1.
+//
+// The failure mode, which is a narrow band rather than a class: a desktop
+// window whose inner box is barely wider than it is tall has an outer box that
+// chrome makes taller than it is wide, so the pairs disagree and a zoom there
+// reads as 1. What that costs is a fit performed WHILE zoomed in such a window
+// - a reload or a resize - which fills rather than dividing the zoom out. It
+// cannot be told apart from the phone by these four numbers, and the phone is
+// the case that is wrong on every rotation rather than in a band.
+function pageZoom (view) {
+    if (! (view.innerWidth > 0)) { return 1; }
+
+    const crossways = (view.outerWidth > view.outerHeight)
+        !== (view.innerWidth > view.innerHeight);
+
+    return crossways ? 1 : view.outerWidth / view.innerWidth;
+}
+
 // What just happened to the window, given two readings of it: `window`, a real
-// resize; `display`, the same window on glass of a different density; `zoom`,
-// the player working the browser's own control; or `none`.
+// resize OR a rotation; `display`, the same window on glass of a different
+// density; `zoom`, the player working the browser's own control; or `none`.
 //
 // This exists because the page had no way to tell those apart and refitted on
 // all of them, which is the whole of the defect above. A zoom is the player
@@ -4818,6 +4921,25 @@ function layoutChange (before, after) {
     // decide. A first paint that skipped the fit would leave the canvas at
     // whatever the markup said.
     if (! before) { return "window"; }
+
+    // A rotation is a window change whatever the device reports about it, and
+    // it has to be asked first because on a phone it can wear a zoom's exact
+    // signature: the inner box turns over and the outer pair, which is the
+    // screen, may not move at all. Declined as a zoom it leaves a portrait
+    // canvas in a landscape window, which the whole multiple used to hide -
+    // the box was a step smaller than the room and usually still fitted - and
+    // which filling the span cannot, since a box that exactly fills one
+    // orientation overflows the other.
+    //
+    // Reading the turn off the inner box rather than off `screen.orientation`
+    // keeps this function what it is, four numbers in and a verdict out, with
+    // no browser in it. Nothing else here can produce the flip: a zoom scales
+    // both dimensions by one factor and cannot reorder them, and a display
+    // change moves neither.
+    const turned = (before.innerWidth > before.innerHeight)
+        !== (after.innerWidth > after.innerHeight);
+
+    if (turned) { return "window"; }
 
     if (before.outerWidth !== after.outerWidth
         || before.outerHeight !== after.outerHeight)
@@ -5238,7 +5360,7 @@ if (typeof module !== "undefined") {
         dayNumber,
         resourceBase, composeRun, queryArguments, argumentList,
         runTaskBody, TaskRunner, sizeClass,
-        Input, pointerPixel, canvasScale, gridSnap, layoutChange,
+        Input, pointerPixel, canvasScale, gridSnap, pageZoom, layoutChange,
         halted, haltChange,
         paint, paletteEntries, luminance, contrast, theme, resourceLine,
         taskLine, controlsLine, fillLegends,

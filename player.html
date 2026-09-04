@@ -48,21 +48,41 @@
      actually there.
 
      The `vh` line stays underneath it for anything that does not know the unit,
-     which then gets the old behaviour rather than no height at all. Padding is
-     not part of this: `box-sizing: border-box` is set on everything above, so
-     the 20px has always been inside the height rather than added to it. */
+     which then gets the old behaviour rather than no height at all. */
+
+  /* NO PADDING, which is a measurement rather than a taste. The canvas is a
+     whole multiple of 240 device pixels, so every pixel the page keeps for
+     itself is spent in steps of a whole scale - and a 20px surround is exactly
+     what stood between several real devices and a step larger game. Their own
+     viewports, run through `canvasScale`: an iPhone SE drew at 2 with the
+     padding and draws at 3 without, a 15 Pro Max at 4 and now 5, an iPad mini
+     at 5 and now 6, each of them decided by the width rather than the height,
+     so a toolbar cannot change the reading. Where it buys no step it costs
+     nothing either: the leftover of a whole multiple is centred slack, and the
+     total space around the game is the same however it is divided.
+
+     The page measures this rather than knowing it - `available` below reads
+     the computed padding, so this line is the only place the number lives, and
+     a surround put back here is one the fit will see.
+
+     The chrome keeps a margin of its own, on the row instead of on the page:
+     `#hud` carries the horizontal padding now, so a legend on a narrow phone
+     still stands off the edge while the canvas above it no longer has to. */
   body {
       margin: 0;
       min-height: 100vh; min-height: 100dvh;
       background: var(--surround); color: var(--ink);
       font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-      display: flex; flex-direction: column; gap: 14px; padding: 20px;
+      display: flex; flex-direction: column; gap: 14px; padding: 0;
       align-items: center; justify-content: center;
       align-items: safe center; justify-content: safe center;
   }
   /* `touch-action: none` is not decoration: without it the first drag across
      the canvas scrolls the page instead of playing the game, and on a phone
-     that is every gesture a pointer game is made of.
+     that is every gesture a pointer game is made of. It is not the whole of
+     that story either: iOS zooms the page on a double tap over the screen in
+     spite of this declaration, and the script below refuses that gesture where
+     the declaration is ignored.
 
      No border and no radius, and what that gives up is worth stating. The
      page's background is the game's own `background` entry, so on a game
@@ -95,7 +115,7 @@
       -webkit-tap-highlight-color: transparent;
   }
   #hud { display: flex; gap: 18px; align-items: center; flex-wrap: wrap;
-         justify-content: center; min-height: 20px; }
+         justify-content: center; min-height: 20px; padding: 0 12px; }
   /* Said again here because the rule above would otherwise silently beat it: an
      author `display: flex` outranks the UA stylesheet's `[hidden] { display:
      none }` whatever the specificity, so without this line the attribute the
@@ -712,6 +732,38 @@ canvas.addEventListener ("contextmenu", event => {
     }
 });
 
+// The double tap, which is iOS asking a question this page has already
+// answered. `touch-action: none` on the canvas is meant to settle it - the
+// declaration says that no gesture beginning on the screen is the browser's -
+// and Safari zooms the page a step on two quick taps over it anyway, which on a
+// game whose taps ARE its input is every other move. What survives the
+// declaration does not survive a refusal: the zoom is raised off the second
+// `touchend`, so cancelling that one event is the whole fix, and it is scoped
+// to the canvas and to a second tap rather than turned on the page.
+//
+// PINCH is deliberately left alone. Zooming in past the window is an ordinary
+// thing to do here - the `safe` alignment at the top of the page exists for it,
+// and the sizing declines to refit on a zoom precisely so that a player who
+// zoomed in stays zoomed in - so `user-scalable=no` in the viewport tag would
+// have been the wrong answer even on the iOS versions that still honoured it.
+// This takes the one gesture that collides with play and leaves the one that
+// helps.
+//
+// What a cancelled `touchend` costs is the compatibility mouse events, and
+// nothing on this canvas listens for one: the game's input is queued off the
+// pointer events above, which a refused touch event does not cancel, and the
+// audio unlock hangs off `pointerdown`. So the window can be generous - 350 ms
+// rather than the 300 ms a double tap is usually quoted at - because
+// overshooting it suppresses nothing anybody can see.
+
+let lastTapEnd = 0;
+
+canvas.addEventListener ("touchend", event => {
+    if (event.timeStamp - lastTapEnd < 350) { event.preventDefault (); }
+
+    lastTapEnd = event.timeStamp;
+}, { passive: false });
+
 // The canvas keeps its 240x240 backing store at every size: only the CSS box
 // changes, and `image-rendering: pixelated` makes the browser's upscale a
 // nearest neighbour one. How large that box is, and why it is counted in device
@@ -752,23 +804,15 @@ function available () {
     return { width: innerWidth - horizontal, height: innerHeight - vertical };
 }
 
-// How far the page is zoomed, as the factor that turns a CSS pixel back into
-// the one it would be at 100%. `outerWidth` is the window in screen
-// coordinates and page zoom does not move it, where `innerWidth` is CSS pixels
-// and does - so the two divide to exactly the zoom, and `canvasScale` says what
-// it is for and what happens on a browser that reports nothing useful here.
-//
-// Width rather than height because the browser's own chrome is above the page,
-// not beside it: `outerHeight` carries a tab strip and an address bar that
-// `outerWidth` does not, and a docked console takes innerHeight without
-// touching outer at all.
-
-function pageZoom () {
-    return innerWidth > 0 ? outerWidth / innerWidth : 1;
-}
+// How far the page is zoomed is `pageZoom` in `player.js`, which takes the four
+// numbers `reading` gathers and says what it does with a phone, where the outer
+// pair is the screen rather than the window. It moved there when it stopped
+// being a division: what a reading MEANS lives on the far side of this page's
+// line, with `canvasScale` and the key table, and only the globals are here.
 
 function fitCanvas () {
-    const box = canvasScale (available (), devicePixelRatio, pageZoom ());
+    const box = canvasScale (available (), devicePixelRatio,
+        pageZoom (reading ()));
 
     canvas.style.width = box.width + "px";
     canvas.style.height = box.height + "px";
