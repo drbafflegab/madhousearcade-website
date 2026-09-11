@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Freecell</title>
+<style>
+  :root { color-scheme: dark; }
+
+  body { margin: 0; min-height: 100vh;
+         display: flex; align-items: center; justify-content: center;
+         background-color: #08080e; color: #6a6a80;
+         font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  a { color: #e0a33c; }
+</style>
+<script>
+const segments = location.search.replace (/^\?/, "").split ("&")
+    .filter (segment => segment !== "");
+
+const keyOf = (segment) => {
+    const cut = segment.indexOf ("=");
+    const raw = cut < 0 ? segment : segment.slice (0, cut);
+
+    try { return decodeURIComponent (raw.replace (/\+/g, " ")); }
+    catch { return raw; }
+};
+
+const carried = segments.filter ((segment) => {
+    const key = keyOf (segment);
+
+    return key !== "module" && key !== "resources";
+});
+
+const query = ["module=games/freecell/freecell.wasm"]
+    .concat (carried).join ("&");
+
+location.replace ("../player.html?" + query);
+</script>
+</head>
+<body>
+<a href="../player.html?module=games/freecell/freecell.wasm">play Freecell</a>
+</body>
+</html>

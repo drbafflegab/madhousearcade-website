@@ -174,9 +174,11 @@
 </div>
 
 <!-- The player's browser-free half, and everything below this line is the
-     browser's: the canvas, the audio context, the animation frame and the
-     keyboard the page takes them from. Loaded as a classic script so that its
-     declarations are in scope for the inline one that follows.
+     browser's: the canvas ELEMENT and its box, the audio context, the listeners
+     and the store. The picture is drawn two threads away, in
+     `render.worker.js`, into a canvas this page transfers to it once per run.
+     Loaded as a classic script so that its declarations are in scope for the
+     inline one that follows.
 
      `products/web-player/source/player.js` says why the split is where it is
      and what runs the far side of it without a browser. -->
@@ -193,7 +195,13 @@
 // refusal can happen while the module is being read, which is before the const
 // below exists.
 
-onRefusal (reason => {
+// A named function rather than the arrow it used to be, because a refusal is no
+// longer the only thing with a sentence to put here. The watchdog below has one
+// too and it must not throw - a run that has already stopped needs no exception
+// unwinding a callback - so the two share the banner and differ in what happens
+// after it.
+
+function showAlarm (reason) {
     const banner = document.getElementById ("hud");
 
     if (! banner) { return; }
@@ -210,7 +218,9 @@ onRefusal (reason => {
 
     banner.textContent = "player: " + reason;
     banner.style.color = "var(--alarm)";
-});
+}
+
+onRefusal (showAlarm);
 
 // ---------------------------------------------------------------------------
 // Which game this is.
@@ -344,15 +354,36 @@ let runSeed = 0;
 let runArguments = null;
 
 // ---------------------------------------------------------------------------
-// Audio. The game renders its own samples; this only plays them.
+// Audio. The game renders its own samples, ON THE AUDIO THREAD.
 //
 // There is no synthesiser here and no second implementation to keep in step
-// with the CLI - `render_audio` produced these samples inside the game's own
-// wasm module, so the page and `inspector wav` are playing arithmetic that ran
-// in the same code. A ctest renders every golden replay through both targets
-// and compares the samples.
+// with the CLI - `render_audio` runs inside the game's own wasm module, so the
+// page and `inspector wav` are playing arithmetic that ran in the same code. A
+// ctest renders every golden replay through both targets and compares the
+// samples.
 //
-// Two measured constraints shape this (see docs/decisions.md):
+// WHAT MOVED, AND WHAT DID NOT. The simulation used to render each frame's 800
+// samples and post them on, and the processor below was a queue of buffers. It
+// is a CONSUMER now, in exactly the sense `player.js`'s `Consumer` is one: it
+// holds its own instance of the game's module, it is handed the state block per
+// step at the block's own address, and it calls the game's own `render_audio` on
+// it inside `process`. So the host still synthesises nothing, `render_audio`
+// still takes a `void const *`, and the playheads still live in the published
+// state - `docs/decisions.md:169-171` are honoured by construction rather than
+// by promise. What it buys is scheduling: tick N is 800 samples of the audio
+// clock, rendered when the audio clock reaches it, by a producer that is not on
+// the main thread at all.
+//
+// IT IS ONE OF TWO CONSUMERS, and the other draws. Neither is on this thread:
+// the page held one for the picture once and painted from it, and the picture is
+// two threads out now, in `render.worker.js`. What crosses to each is a
+// description the simulation captured and each renders it with the game's own
+// code - the sound per STEP, because a step's state is 800 samples of the audio
+// clock and a step whose state was never published is a hole, and the picture
+// per published FRAME, because a skipped picture is invisible.
+//
+// Measured constraints shape this, and every one is in
+// `docs/runs/threaded-host-run.md` or `docs/decisions.md`:
 //
 // - `addModule` from a blob URL FAILS on file:// with AbortError, while a data:
 //   URI works on both file:// and http://. The page is served now, so the blob
@@ -360,121 +391,432 @@ let runArguments = null;
 //   works everywhere, and swapping it would buy nothing.
 // - An AudioContext created without a user gesture starts suspended and stays
 //   there, so the first gesture of any kind resumes it.
+// - A `WebAssembly.Module` will NOT deserialize into an
+//   `AudioWorkletGlobalScope`: posted to the port it arrives at
+//   `onmessageerror`. The module's BYTES cross, and `new WebAssembly.Module`
+//   compiles synchronously off the main thread - (c). So bytes are posted.
+// - A `MessagePort` DOES cross, and a dedicated worker on the far end of one
+//   feeds the audio thread with no main thread on the path - measured for this
+//   milestone by `scratch/probes/port.sh`, three ticks from a worker straight
+//   into a processor. That is what lets the simulation post its own ticks,
+//   which is the whole of the latency argument: a page relaying them would put
+//   the sound back on the thread the simulation left in order to escape.
 // ---------------------------------------------------------------------------
 
 // The processor's source, as text: it runs in its own global scope with no
-// access to anything here.
-const SAMPLE_PLAYER = `
-// How many frames of sound may be waiting to be played, which IS the latency:
-// each is 800 samples, so a depth of three is 50 ms between a frame being
-// rendered and being heard, plus whatever of a fourth the reader is already
-// inside. The trim below runs on every message, so this is a TARGET rather
-// than a disaster ceiling - a burst is cut straight back to it - and it is
-// also the cushion the queue exists to be, because a producer and a consumer
+// access to anything here, and an `AudioWorkletGlobalScope` cannot
+// `importScripts`. So the FIGURES it needs are interpolated in below and the
+// CODE it needs is written out inside it - the twenty-odd lines that do what
+// `player.js`'s `Consumer` does, because that class cannot be reached from
+// there. The offsets are interpolated rather than restated so that `LAYOUT` in
+// `player.js` stays the one hand mirror of `Game` this player has: a third copy
+// would be a third thing to move when a member is added at the tail.
+const STATE_PLAYER = `
+const SAMPLES_PER_FRAME = ${SAMPLES_PER_FRAME};
+
+const GAME_RENDER_AUDIO = ${LAYOUT.game.renderAudio};
+const GAME_AUDIO_STATE_SIZE = ${LAYOUT.game.audioStateSize};
+const GAME_BYTES = ${LAYOUT.game.bytes};
+
+// Game_Task_Reader's own two offsets and its size, interpolated with everything
+// else so that LAYOUT in player.js stays the one hand mirror of Game this player
+// has.
+const READER_CONTEXT_AT = ${LAYOUT.reader.context};
+const READER_BYTES_AT = ${LAYOUT.reader.bytes};
+const READER_STRIDE = ${LAYOUT.reader.stride};
+
+// And the sentinel this processor writes into its own record's context. A
+// literal rather than an interpolation, and deliberately: the value is written
+// here and read here, in one instance's own memory, so it never has to agree
+// with the one player.js writes into the simulation's record. What it is for is
+// telling this instance's record from anything else a game might pass back,
+// which is a question with one asker.
+const READER_CONTEXT = 0x30000000;
+
+// How many TICKS of sound may be waiting to be rendered, which IS the latency:
+// each is one 60 Hz frame, 800 samples, so a depth of three is 50 ms between a
+// frame being stepped and being heard, plus whatever of a fourth the reader is
+// already inside. The trim below runs on every message, so this is a TARGET
+// rather than a disaster ceiling - a burst is cut straight back to it - and it
+// is also the cushion the queue exists to be, because a producer and a consumer
 // both running at 60 Hz hold whatever depth they were left at rather than
 // returning to one.
 //
-// Three is a judgement rather than a measurement, and both sides are worth
-// naming because nothing here can settle it. One is too few: a queue one frame
-// deep is empty for part of every ordinary interval, and process below plays
-// an empty queue as zeros, which is a click. Two survives a single dropped
-// animation frame exactly and with no margin at all - two frames of sound,
-// 33 ms, against the 33 ms gap - and one dropped frame is the commonest hiccup
-// there is on a page that is also compositing a canvas. Eight, which is what
-// this was, is far too many: 133 ms that nothing ever gives back, so every
-// sound arrives eight frames behind the picture that made it and stays there
-// until the page is reloaded. Three absorbs a dropped frame with a whole frame
-// to spare, for 50 ms.
+// THREE IS A READING NOW RATHER THAN A JUDGEMENT, and the reading is the plan's
+// own rule applied to docs/runs/threaded-host-run.md (b): the smallest N for
+// which a producer gap longer than N ticks is rarer than p99.9, plus one,
+// floored at two. A dedicated worker running a self-correcting setTimeout aimed
+// at 16.667 ms, in headless Chrome 152 over 60 seconds, visible: n 3,598,
+// p50 16.5 ms, p99 24.6, p99.9 25.6, max 26.1. Gaps longer than ONE tick are
+// 1,621 of 3,598 - 45%, and arithmetic rather than jitter, since a producer
+// aimed at exactly 60 Hz is over 16.667 ms about half the time by construction.
+// Gaps longer than TWO ticks are 0 of 3,598. So N = 2, the depth is 3, and
+// moving the producer off the page's animation frame bought no depth back.
 //
-// It is also the whole answer to a queue holding sound that is out of date,
-// which is why there is no way to empty one here. There was a drain - a
-// message that set the queue length to zero - and nothing in this tree ever
-// posted one, so it has gone. Given a caller it would have been wrong rather
-// than merely idle: the depth is the cushion as well as the latency, and two
-// clocks at the same rate never rebuild a cushion they are robbed of, so
-// emptying the queue on a reset or a resume would buy back 50 ms of sound
-// nobody can place and pay a click for every hiccup for the rest of the run.
+// WHAT THAT READING CANNOT SEE, said beside it because a number with a figure
+// next to it reads settled and this one is not. It was taken in headless
+// Chrome, whose animation frame is a timer-driven fake vsync with a 0.3 ms
+// spread over 3,600 frames - so it removes exactly the layout, collection and
+// compositor jitter this design exists to escape, and a headed browser could
+// move it. In the BACKGROUND the same timer is not a slow producer but a
+// stopped one - p99.9 767 ms, max 1,584 ms, 293 gaps over two ticks in 60 s -
+// which is why the page halts on hidden rather than buffering through it, and
+// is not a depth any queue could be built to cover.
 //
-// There is no browser in ctest, so neither side of the judgement is measured.
-// What would settle it is a real output device, an animation frame
-// deliberately blown, and somebody listening for the click.
-const QUEUE_DEPTH = 3;
+// The floor of two is the plan's and stands whatever a later reading says. One
+// is too few twice over: a queue one tick deep is empty for part of every
+// ordinary interval, and process below plays an empty queue as zeros, which is
+// a click - and the processor now also has to run render_audio, 1.6 us measured
+// on the audio thread, before the quantum that needs the samples. Eight, which
+// is what this once was, is far too many: 133 ms that nothing gives back.
+//
+// It is fixed rather than adaptive, and that is the same sentence as the trim
+// having no drain. There was a drain - a message that set the queue length to
+// zero - and nothing in this tree ever posted one, so it went. Given a caller
+// it would have been wrong rather than merely idle: the depth is the cushion as
+// well as the latency, and two clocks at the same rate never rebuild a cushion
+// they are robbed of, so a scheme that shrinks needs a way to grow back, and
+// growing back is a lag controller this tree has deferred whole.
+const QUEUE_TICKS = 3;
 
-class SamplePlayer extends AudioWorkletProcessor {
+// The consumer, on the audio thread. It never calls construct and never calls
+// step: what it holds is bytes it was handed plus whatever the module's own
+// data segments put there, and what it runs on them is the game's own
+// render_audio.
+//
+// It takes no imports, and it installs ONE thing: the trampoline, so that a
+// sound description naming a task by id can be answered. A renderer calls no
+// host function of its own accord - measured in
+// docs/runs/threaded-host-run.md (a) over forty-four recordings and (c) inside
+// this very scope - but a capture carries an id where a state block carried a
+// pointer, and Game_Task_Reader is the one question that leaves. What it costs
+// this scope is a second WebAssembly.Module compiled here, out of bytes rather
+// than out of a module, for the reason the game's is: a Module will not
+// deserialize into an AudioWorkletGlobalScope and bytes cross without
+// complaint. It happens once per run, before anything is playing.
+class StatePlayer extends AudioWorkletProcessor {
     constructor () {
         super ();
 
-        // Frames arrive from the main thread on requestAnimationFrame's clock
-        // and are consumed on the audio clock. A queue absorbs the difference.
+        // Ticks arrive from the simulation's own thread and are consumed on the
+        // audio clock. A queue absorbs the difference. What it holds is state
+        // blocks rather than samples now, and the entry for a tick a game
+        // reported silent is the silence below - so an entry is one tick of
+        // TIME whichever kind it is.
         this.queue = [];
         this.pending = null;
         this.pendingAt = 0;
 
-        // One frame of zeros, for every frame a game reports as silent. The
+        // One frame of zeros, for every tick a game reports as silent. The
         // length is the page's own constant, interpolated in with the rest of
-        // this source, so a silent frame is exactly as long as a rendered one.
+        // this source, so a silent tick is exactly as long as a rendered one.
         //
-        // It lives on THIS side because the main thread cannot keep one: the
-        // page hands a rendered frame over with a transfer list, which detaches
-        // the buffer, so a single shared block of silence over there would work
-        // exactly once and every later post would carry a detached buffer.
-        //
-        // Sharing one array across several queued frames is safe because
-        // nothing here ever writes to a queued frame - the reader below takes
-        // it and drops it - and each entry is consumed on its own cursor, so
-        // two entries that are the same array play as two frames of silence.
-        this.silence = new Int16Array (${SAMPLES_PER_FRAME});
+        // Sharing one array across several queued ticks is safe because nothing
+        // here ever writes to it and each entry is consumed on its own cursor,
+        // so two entries that are the same array play as two frames of silence.
+        // It doubles as the SENTINEL saying which kind an entry is, which is why
+        // next below compares against it by identity.
+        this.silence = new Int16Array (SAMPLES_PER_FRAME);
 
+        // Where a rendered tick is copied to, once per tick. The game renders
+        // into its own linear memory at the same address every time and
+        // memory.grow detaches every view over a buffer, so a view kept across a
+        // delivery would be a view of nothing; 800 shorts is 44 ns, measured.
+        this.rendered = new Int16Array (SAMPLES_PER_FRAME);
+
+        this.instance = null;
+        this.renderAudio = null;
+        this.states = null;
+
+        // The task blocks this instance holds, by the id that names them, which
+        // is the whole of what a reader here answers out of. An id rather than
+        // an address because the simulation's arena recycles a block the moment
+        // a release settles, so one address carries one task's answer and then
+        // another's.
+        this.blocks = new Map ();
+
+        this.readerPtr = 0;
+        this.readerArmed = false;
+
+        // Where the sound description lands. Settled in open below and read
+        // once per tick.
+        this.description = 0;
+
+        // The page opens a run: the module's bytes, the trampoline's bytes, the
+        // addresses its simulation laid down, the regions laid down once, and
+        // the port every tick will arrive on. It is the only thing the page
+        // ever says here.
         this.port.onmessage = (message) => {
-            // A silent frame is a message with no buffer on it, and it takes a
-            // queue slot like any other frame because what the queue really
-            // holds is TIME. Dropped instead, the queue would drain 800 samples
-            // early for every silent frame and the next sound would arrive
-            // ahead of the frame it belongs to.
+            this.open (message.data.bytes, message.data.trampolineBytes,
+                message.data.layout, message.data.regions, message.data.port);
+        };
+    }
+
+    // Enough linear memory for span bytes at at, which is the whole of what
+    // this class does for itself: it lays no arena down, and every address it
+    // uses arrived in the layout its simulation published.
+    room (at, span) {
+        const need = at + span;
+        const have = this.memory.buffer.byteLength;
+
+        if (need <= have) { return; }
+
+        this.memory.grow (Math.ceil ((need - have) / 65536));
+    }
+
+    // One region of the simulation's memory, written at its own address.
+    accept (address, bytes) {
+        if (! this.instance || ! bytes || ! bytes.length) { return; }
+
+        this.room (address, bytes.length);
+
+        new Uint8Array (this.memory.buffer, address, bytes.length).set (bytes);
+    }
+
+    open (bytes, trampolineBytes, layout, regions, port) {
+        // THE MODULE'S BYTES RATHER THAN THE MODULE. A WebAssembly.Module will
+        // not deserialize into this scope - posted to the port above it arrives
+        // at onmessageerror - and the bytes cross without complaint, where
+        // new WebAssembly.Module compiles synchronously off the main thread at
+        // any size. It happens once per run, before anything is playing.
+        const instance = new WebAssembly.Instance (
+            new WebAssembly.Module (bytes), {});
+
+        const ex = instance.exports;
+
+        this.instance = instance;
+        this.memory = ex.memory;
+
+        // The descriptor, off THIS instance's own factory rather than taken
+        // from the simulation's: the function pointer on it is an index into
+        // this instance's own table. factory writes host memory at an address
+        // the simulation also spent on host memory, so nothing a state can
+        // reference is touched.
+        this.room (layout.game, GAME_BYTES);
+
+        new Uint8Array (this.memory.buffer, layout.game, GAME_BYTES).fill (0);
+
+        ex.factory (layout.game);
+
+        const view = new DataView (this.memory.buffer);
+
+        const audioAt = view.getUint32 (layout.game + GAME_RENDER_AUDIO, true);
+
+        const audioStateSize =
+            view.getUint32 (layout.game + GAME_AUDIO_STATE_SIZE, true);
+
+        this.samplesPtr = layout.samples;
+
+        // What render_audio is handed, and the state block is not among the
+        // things this processor is ever posted: a module that renders sound
+        // describes it or does not load, so there is nothing here to choose
+        // between. 0 for a silent game, whose ticks are all silence and never
+        // reach the line that reads this.
+        this.description = layout.audioState;
+
+        // Room for both blocks in one go, and the audio block is also the answer
+        // to where this processor's own 1,600 bytes of scratch go: at the
+        // address the simulation's own arena gave its Game_Audio_Block, which by
+        // construction overlaps no state and no task block, because that arena
+        // is what laid all three down.
+        this.room (layout.samples, SAMPLES_PER_FRAME * 2);
+
+        if (audioStateSize) { this.room (layout.audioState, audioStateSize); }
+
+        // The one wasm function this instance needs of its own, and the record
+        // that names it. The record's ADDRESS is the simulation's, published in
+        // the layout beside the framebuffer's, because this instance lays no
+        // arena down; what goes in it is this instance's own table index, which
+        // is why it is composed here rather than mirrored across.
+        //
+        // A run opened without the bytes - a host that never sent them - leaves
+        // readerPtr at 0, which is the null reader every renderer accepts. It
+        // then answers no id at all, which a game whose description names none
+        // never notices.
+        this.blocks.clear ();
+        this.readerPtr = 0;
+
+        if (trampolineBytes && layout.reader) {
+            const table = ex.__indirect_function_table;
+            const at = table.grow (6);
+
+            const shim = new WebAssembly.Instance (
+                new WebAssembly.Module (trampolineBytes), { host: {
+                    spawn: () => 0,
+                    done: () => 0,
+                    bytes: () => 0,
+                    release: () => {},
+                    load: () => 0,
+                    read: (context, id, size) => this.read (context, id, size),
+                } });
+
+            table.set (at, shim.exports.spawn);
+            table.set (at + 1, shim.exports.done);
+            table.set (at + 2, shim.exports.bytes);
+            table.set (at + 3, shim.exports.release);
+            table.set (at + 4, shim.exports.load);
+            table.set (at + 5, shim.exports.read);
+
+            this.room (layout.reader, READER_STRIDE);
+
+            const compose = new DataView (this.memory.buffer);
+
+            compose.setUint32 (layout.reader + READER_CONTEXT_AT,
+                READER_CONTEXT, true);
+            compose.setUint32 (layout.reader + READER_BYTES_AT, at + 5, true);
+
+            this.readerPtr = layout.reader;
+        }
+
+        // AFTER the growth, because a table entry is a function and survives one
+        // where a view would not. Null is a game that declares no render_audio,
+        // and every tick of one plays as the silence above.
+        this.renderAudio = audioAt
+            ? ex.__indirect_function_table.get (audioAt) : null;
+
+        // The regions the host laid down once and never writes again: the
+        // argument storage and the save blob construct was handed. A game may
+        // hold a pointer into either, so both are here before the first state
+        // can be rendered.
+        for (const region of regions || []) {
+            this.accept (region.address, region.bytes);
+        }
+
+        // A new run is a new linear memory on both sides, so whatever this queue
+        // was holding belongs to a session that no longer exists. This is not
+        // the drain the comment above refuses - that one emptied a queue mid-run
+        // and robbed it of its cushion; this is the queue of the run that ended.
+        this.queue.length = 0;
+        this.pending = null;
+        this.pendingAt = 0;
+
+        if (this.states) { this.states.close (); }
+
+        this.states = port;
+
+        // The handler that runs on the audio thread, and it has to stay trivial:
+        // one branch, one push, one splice.
+        this.states.onmessage = (message) => {
+            // A delivery - a task's output - at its own address AND under its
+            // own id. It arrives BEFORE any description that can name it, which
+            // is the order the simulation posts in, so a block is never named by
+            // a description this instance cannot reach.
+            //
+            // NOTHING EXPIRES ONE. The simulation reclaims a released block at
+            // the frame boundary that settles the release; the copy here is
+            // this instance's own, and the queue is up to QUEUE_TICKS deep, so
+            // a description still on it may name a block the simulation has
+            // already given back. Holding the copy is what makes that a sound
+            // rather than a refusal.
+            if (message.data.address !== undefined) {
+                this.accept (message.data.address, message.data.bytes);
+
+                this.blocks.set (message.data.id, {
+                    address: message.data.address,
+                    span: message.data.bytes.length });
+
+                return;
+            }
+
+            // A silent tick takes a queue slot like any other, because what the
+            // queue really holds is TIME. Dropped instead, it would drain 800
+            // samples early and the next sound would arrive ahead of the frame
+            // it belongs to.
             this.queue.push (message.data.silent
                 ? this.silence
-                : message.data.samples);
+                : message.data.audioState);
 
             // A producer far ahead is a stall that already happened, and its
-            // backlog is latency nothing gives back. Cut to QUEUE_DEPTH on
-            // every message rather than only past some larger ceiling, which
-            // is what makes it self correcting: a catch-up of eight steps
-            // leaves the queue at three rather than at eight, so the run does
-            // not spend the rest of its life at the depth of its worst moment.
+            // backlog is latency nothing gives back. Cut to QUEUE_TICKS on every
+            // message rather than only past some larger ceiling, which is what
+            // makes it self correcting: a catch-up of eight steps leaves the
+            // queue at three rather than at eight.
             //
-            // The OLDEST go, and that is what keeps the sound with the
-            // picture: the frames dropped are the ones already late, and the
-            // ones kept are the ones about to be drawn.
-            //
-            // Chosen over dropping the SILENT entries first, which would lose
-            // no samples at all. Both are one frame of TIME, so either drop
-            // moves the stream on by the same 16.7 ms and only one of them
-            // also loses sound - but the join a dropped silence leaves is two
-            // rendered frames meeting at whatever phase they happen to be at,
-            // where a dropped rendered frame joins to zeros, and which of the
-            // two clicks louder is not something anything here can measure.
-            // So: one rule and one branch, in the one handler that has to stay
-            // trivial because it runs on the audio thread.
-            if (this.queue.length > QUEUE_DEPTH) {
-                this.queue.splice (0, this.queue.length - QUEUE_DEPTH);
+            // The OLDEST go, and that is what keeps the sound with the picture:
+            // the ticks dropped are the ones already late, and the ones kept are
+            // the ones about to be drawn. It also costs nothing to drop one now,
+            // because the samples have not been rendered yet - which is one
+            // thing this shape buys that a queue of buffers could not.
+            if (this.queue.length > QUEUE_TICKS) {
+                this.queue.splice (0, this.queue.length - QUEUE_TICKS);
             }
         };
+    }
+
+    // What a Game_Task_Reader's bytes is here, which is the whole of what a
+    // RENDERER may ask this processor for: a block it was handed, by the id it
+    // was handed it under. size is written on every path out, so a caller reads
+    // a length without first branching on the pointer.
+    //
+    // There is no run to end from the audio thread, so an id this instance does
+    // not hold is a null and a length of zero rather than a refusal - which is
+    // exactly what render_audio is told about a task that is pending or failed,
+    // and is 800 samples of whatever the game draws for that.
+    read (context, id, size) {
+        const put = (span) => {
+            if (! size) { return; }
+
+            new DataView (this.memory.buffer).setUint32 (size, span >>> 0,
+                true);
+        };
+
+        put (0);
+
+        if (context !== READER_CONTEXT || ! this.readerArmed) { return 0; }
+
+        const block = this.blocks.get (id);
+
+        if (! block) { return 0; }
+
+        put (block.span);
+
+        return block.address;
+    }
+
+    // The next tick's 800 samples, rendered HERE: the game's own render_audio,
+    // on the game's own bytes, in this thread's own instance. 1.6 us a call on
+    // the audio thread, measured over 20,000 calls in
+    // docs/runs/threaded-host-run.md (c), against a 2.67 ms quantum.
+    //
+    // Null for an empty queue, which process plays as zeros: the game renders
+    // what it means to sound, so inventing samples would be the host making
+    // something up.
+    next () {
+        const entry = this.queue.shift ();
+
+        if (! entry) { return null; }
+
+        if (entry === this.silence || ! this.renderAudio) {
+            return this.silence;
+        }
+
+        new Uint8Array (this.memory.buffer, this.description, entry.length)
+            .set (entry);
+
+        this.readerArmed = true;
+
+        this.renderAudio (this.description, this.readerPtr, this.samplesPtr);
+
+        this.readerArmed = false;
+
+        this.rendered.set (new Int16Array (this.memory.buffer,
+            this.samplesPtr, SAMPLES_PER_FRAME));
+
+        return this.rendered;
     }
 
     process (inputs, outputs) {
         const out = outputs [0] [0];
 
-        // A render quantum is 128 samples and a console frame is 800, so the
-        // two never line up: frames are handed over a quantum at a time.
+        // A render quantum is 128 samples and a console frame is 800, so the two
+        // never line up: a tick is rendered when the reader reaches it and
+        // handed over a quantum at a time.
         for (let i = 0; i < out.length; i++) {
             if (! this.pending || this.pendingAt >= this.pending.length) {
-                this.pending = this.queue.shift () || null;
+                this.pending = this.next ();
                 this.pendingAt = 0;
             }
 
-            // An empty queue is silence rather than a repeat: the game renders
-            // what it means to sound, so inventing samples would be the host
-            // making something up.
             out [i] = this.pending ? this.pending [this.pendingAt++] / 32768 : 0;
         }
 
@@ -482,7 +824,7 @@ class SamplePlayer extends AudioWorkletProcessor {
     }
 }
 
-registerProcessor ('samples', SamplePlayer);
+registerProcessor ('states', StatePlayer);
 `;
 
 class Synth {
@@ -513,9 +855,9 @@ class Synth {
         try {
             // data:, not a blob: a blob URL fails on file:// - measured.
             await this.ctx.audioWorklet.addModule (
-                "data:text/javascript," + encodeURIComponent (SAMPLE_PLAYER));
+                "data:text/javascript," + encodeURIComponent (STATE_PLAYER));
 
-            this.node = new AudioWorkletNode (this.ctx, "samples", {
+            this.node = new AudioWorkletNode (this.ctx, "states", {
                 numberOfInputs: 0,
                 outputChannelCount: [1],
             });
@@ -528,30 +870,19 @@ class Synth {
 
     resume () { if (this.ctx.state !== "running") this.ctx.resume (); }
 
-    // One message per step, carrying that frame's samples. The buffer is copied
-    // because the game will overwrite it on the very next frame.
-    play (samples) {
-        if (this.node) this.node.port.postMessage ({ samples }, [samples.buffer]);
+    // The run this processor renders, which is the only thing the page ever says
+    // to it: the module's bytes, the addresses the simulation laid down, the
+    // regions it laid down once, and the port the simulation will feed it on.
+    //
+    // The PORT is transferred, and that is what takes this page off the sound's
+    // path for the rest of the run - every tick after this message goes from the
+    // simulation's thread to the audio thread with nothing of this one in
+    // between. The BYTES are copied rather than the compiled module handed over,
+    // because a `WebAssembly.Module` posted here arrives at `onmessageerror`.
+    open (bytes, trampolineBytes, layout, regions, port) {
+        this.node.port.postMessage ({ bytes, trampolineBytes, layout, regions,
+            port }, [port]);
     }
-
-    // The frame a game reported as `game_report_silent`, which is a message
-    // with nothing attached to it.
-    //
-    // Owed rather than skipped, and the interface says why: a display latches
-    // and a speaker does not, so the worklet is still owed 800 samples for this
-    // frame and what it is owed is silence. Feeding it nothing starves the
-    // queue and clicks, and repeating the last block would sound the frame rate
-    // at 60 Hz, because a game whose state is not moving has a frozen
-    // oscillator phase.
-    //
-    // A message rather than a block of zeros because `play` above hands its
-    // buffer over with a transfer list, which DETACHES it - so one shared zero
-    // array is posted once and every later post carries a detached buffer. The
-    // alternative was a fresh 1,600 bytes per silent frame, which is an
-    // allocation every frame for a game that is doing nothing, and that is
-    // exactly the case this path exists to make cheap. The zeros live in the
-    // worklet instead and this says which frame they are for.
-    silence () { if (this.node) this.node.port.postMessage ({ silent: true }); }
 }
 
 // ---------------------------------------------------------------------------
@@ -559,11 +890,24 @@ class Synth {
 // panel must not run the game at double speed.
 // ---------------------------------------------------------------------------
 
-const canvas = document.getElementById ("screen");
-const context = canvas.getContext ("2d", { alpha: false });
-const image = context.createImageData (FRAME_WIDTH, FRAME_HEIGHT);
-const rgba = image.data;
-rgba.fill (255);
+// The console's screen, and the one thing on this page that a run OWNS rather
+// than borrows.
+//
+// It is a `let` because a canvas can be handed to a worker exactly once. The
+// page transfers it with `transferControlToOffscreen` and hands the handle to
+// the RENDER worker, which draws every frame of the run into it from its own
+// thread, and a reset builds new workers on new linear memories - so the
+// outgoing element is spent and `freshCanvas` below puts another in its place.
+// Nothing on this page reads a pixel back, and after the transfer nothing on
+// this page could: the element goes on being laid out, `style.width`,
+// `style.height` and `transform` go on being writable and
+// `getBoundingClientRect` goes on reporting the moved box, which is the whole of
+// what `fitCanvas` and `pointerPixel` need, and only a write to the `width`
+// ATTRIBUTE throws - which this page has never made.
+// `docs/runs/drawing-worker-run.md` (c) is where all of that was measured, in
+// both browsers.
+
+let canvas = document.getElementById ("screen");
 
 // Nothing below runs until a module has been fetched, which is a round trip
 // away rather than in hand: the page is built, then it waits. Everything the
@@ -580,31 +924,198 @@ let wasmBytes = null;
 // page plays every game.
 let trampoline = null;
 
+// And its BYTES, for the one consumer that cannot be handed the module: an
+// `AudioWorkletGlobalScope` will not deserialize a `WebAssembly.Module`, so the
+// processor compiles its own out of these exactly as it compiles the game's.
+let trampolineBytes = null;
+
 // And the rulebook every host answers a spawn, an id's validity and a refused
 // argument out of. The MODULE is held rather than an instance, because a
 // session wants one of its own: an instance is a linear memory, and a reset is
 // a new one - here as much as for the game beside it.
 let core = null;
 
-let session = null;
+// The three threads a run is, none of which is this one.
+//
+// `sim` is `sim.worker.js` - `construct`, `step`, the task table, the input
+// queue, the clock and the recorder. `render` is `render.worker.js` - a second
+// instance of the game's own module, the canvas this page transferred, and
+// `render_video` on the descriptions the simulation posts it. `synth` is the
+// audio context and the worklet behind it, a third instance rendering
+// `render_audio` on the descriptions the simulation posts IT. None of them
+// exists until a module has been fetched, and `reset` replaces all three,
+// because a run is a linear memory and a reset is a new one.
+//
+// THIS PAGE HOLDS NEITHER CONSUMER, and that is the whole shape of the player.
+// It held one for the picture once - an instance handed the state block after
+// every tick, on which the page ran `render_video` and `save` - and what that
+// bought was a picture drawn from a copy on the thread the browser also lays
+// out and collects on. The picture went to the simulation's thread, and then out
+// again to a thread of its own: `docs/archived/render-worker-plan.md` is why,
+// and the price is one display frame paid to make a renderer that never returns
+// survivable. What is left here is the brokering - two `MessageChannel`s this
+// page makes and hands away, after which a step reaches a speaker and a screen
+// with nothing of this thread on either path.
+
+let sim = null;
+let render = null;
 let synth = null;
 
-// The queue itself is `Input`, in `player.js`, because what a key means to this
-// console is a table rather than an event: these two listeners are the whole of
-// what the browser contributes. `M`, `R`, `F`, `I` and `Enter` are the page's
-// own and never reach it - the console has six buttons and none of them is one
-// of these. Escape is nobody's here: the browser spends it leaving fullscreen.
+// What this run would keep if the page went away now, as the simulation last
+// rendered it - or null before a frame has stepped, and for a game that
+// persists nothing.
+//
+// PUSHED RATHER THAN ASKED FOR, which is the same move `runRecord` below makes
+// and the same reason. The store is `localStorage` and there is none on a
+// worker's thread, so the blob has to cross; and the commonest way a game is
+// left is a closed tab, where `writeSave` runs inside `pagehide` with no round
+// trip left to take. So every frame message that stepped carries one and this
+// keeps the newest.
 
-const input = new Input ();
+let keptSave = null;
+
+// This page's end of the channel between the simulation and the worklet, from
+// the moment `reset` makes it until `openAudio` gives it away.
+//
+// It is made in `reset` rather than when the worklet is ready, and that is the
+// whole of what it buys: the simulation starts posting ticks into it at once,
+// a port holds what is posted to it until it is started, and a transferred port
+// takes its queue with it - so the frames a run sounds while `addModule` is
+// still resolving are heard rather than dropped. The trim on the far side is
+// what makes that safe: a queue handed forty ticks at once is three deep on the
+// next message.
+//
+// Null the moment it has been handed over, and null on a page whose worklet
+// never arrived - `openAudio` tells the simulation so, because a port nobody
+// drains is a state block a second that nothing ever frees.
+
+let audioPort = null;
+
+// And this page's end of the channel between the simulation and the RENDERER,
+// from the moment `reset` makes it until `openRender` gives it away.
+//
+// Everything the port above says applies here word for word: it is made in
+// `reset` so the simulation starts posting descriptions into it at once, a port
+// holds what is posted to it, and a transferred port takes its queue with it -
+// so the frames a run draws while the render worker is still fetching and
+// compiling are drawn rather than dropped. What differs is the far side's
+// backlog rule, because it has none: a renderer handed forty descriptions at
+// once draws forty pictures into one canvas as fast as it can and the last one
+// is the one anybody sees.
+//
+// AND THE CANVAS BESIDE IT, held for exactly the same window and handed over in
+// exactly the same message, because it comes from the same place: a canvas may
+// be transferred once per element, so the handle is taken at the moment `reset`
+// makes the element and cannot be taken again later.
+
+let screenPort = null;
+let screenHandle = null;
+
+// The module this run compiles from, and what it declares about itself.
+//
+// `declaration` is a `Consumer` with no layout - a bare instance read for the
+// name, the version, the palette, the colours, the controls and the save size,
+// and then left alone. It is the ONLY instance of a game this page holds now,
+// and it answers everything the page asks the module about that is not a
+// picture: the store is keyed by the name, a recording is headed with the name
+// and the version, the HUD is filled from the controls, and the chrome takes its
+// colours from the palette - all before the worker has said where it put
+// anything, and none of it needing a state.
+
+let gameModule = null;
+let declaration = null;
+
+// What this run would be recorded as, kept up to date rather than asked for, and
+// the thing that decides the simulation has stopped answering.
+//
+// `runRecord` is `player.js`'s own record: the seed, the blob and the pairs the
+// run was constructed from, which arrive once with `opened`, and the four replay
+// logs, which the simulation adds to a frame at a time. Null until a run has
+// opened. `mark` composes a file out of it and so does `seize`, and neither asks
+// the other thread anything - which is the whole point, because the one run that
+// most needs a recording is the one whose thread has stopped answering.
+//
+// `watchdog` is `Watchdog` with the page's own animation frame as its clock: the
+// page tells it each frame it read and each frame message that came back, and it
+// says when nothing has. One per run, like the worker beside it, because a reset
+// is a new simulation and owes nothing for the old one's silence.
+//
+// `renderWatch` is `RenderWatch` on the same clock and over the other thread's
+// heartbeat, and it is a second rule rather than a second instance of the first:
+// what it reads is whether the newest picture the simulation published is still
+// undrawn, so a resting game and a halted page owe it nothing. What it decides
+// is different too - the simulation's silence is the run ending and the
+// renderer's is a renderer replaced, once, and the run ending the second time.
+// `RenderWatch` in `player.js` argues both halves.
+
+let runRecord = null;
+let watchdog = new Watchdog ();
+let renderWatch = new RenderWatch ();
+
+// Where the simulation's arena put things, kept rather than spent.
+//
+// The addresses and the regions arrive once, with `opened`, and the page used to
+// hand them straight to the two consumers and forget them. It cannot any more:
+// a renderer the page REPLACES has to be told exactly what the first one was
+// told, and the only thread that knows it is the one this page must not
+// interrupt to ask. So the message is held for the life of the run, which costs
+// two small objects and a copy of the argument storage and the save blob - both
+// of them regions `interface/game.h:34-44` fixes for the whole run, so a copy
+// taken at frame 0 is still the bytes a renderer needs at frame ten thousand.
+//
+// Null until the run has opened, and null again on a reset.
+
+let arena = null;
+
+// The canvas element the outgoing renderer last drew into, held over the
+// incoming one until that one has drawn.
+//
+// `docs/archived/render-worker-plan.md`'s first question, answered: a player
+// watching a renderer be replaced sees the LAST GOOD FRAME, frozen, because it
+// is already on a canvas and a blank would read as a crash to somebody about to
+// see the game resume. The replacement cannot be painted with it instead - a
+// canvas that has had a context is a canvas `transferControlToOffscreen`
+// refuses, so the page cannot draw one frame into an element it is about to
+// give away - and that leaves keeping the old element, which needs no pixel
+// read back and no browser feature at all: it is an element showing the bitmap
+// its dead worker last committed.
+//
+// Out of the flow and over the top, rather than in place of the new one, so
+// that the element the run is drawing into is the one in the document being
+// laid out and sized. Null at every moment except the window between a renderer
+// being replaced and its replacement's first picture.
+
+let frozen = null;
+
+// What the page is still waiting for the simulation to answer before it may act
+// on a halt. Exactly one thing can be: the real frame a pause costs, which
+// `stepPointerAway` asks for and which has to be PUBLISHED - to the speaker and
+// to the renderer both - before the audio context is suspended. Everything else
+// a halt does needs no answer.
+//
+// Published rather than painted, and the distinction is new: the page used to
+// learn on this message that the pixels were on the canvas, because the thread
+// that posted it had just written them. It learns that the description went out
+// now, and the picture lands a thread later - which is the display frame
+// `docs/archived/render-worker-plan.md` says is paid. The sound is what this
+// gates and the sound is posted on the same message, so what it is waiting for
+// has not changed.
+
+let quietWhenPublished = false;
 
 // Every event this console accepts is a reason for a resting game to be running
-// again, and this is the whole of how it is told. On the QUEUE rather than on
-// each listener below: a host waking from a list of event names has to be
-// edited every time the console learns about one more, and the failure of
-// forgetting one is a player pressing a key that never arrives. `wake` is a
-// no-op on a game that is not resting, which is every frame of most runs.
+// again, and the page tells itself so where it takes the event off the browser.
+//
+// HERE RATHER THAN ON THE QUEUE, which is where it was and where `Input.onQueued`
+// still is. The queue is on the other thread now, and a wake that came back as a
+// message would arrive outside the handler that caused it - which is exactly
+// where `AudioContext.resume` is refused, because user activation is transient
+// and does not survive a round trip. So the page wakes itself, one line before
+// it posts the event on, and `sim.worker.js` leaves `onQueued` alone and says
+// why. What that costs is the property the old placement bought: a listener
+// added below and not given this line is a key that never wakes a resting game.
 
-input.onQueued = wake;
+function post (message) { if (sim) { sim.postMessage (message); } }
 
 addEventListener ("keydown", event => {
     if (event.code === "KeyM") { mark (); return; }
@@ -624,14 +1135,27 @@ addEventListener ("keydown", event => {
         return;
     }
 
-    if (input.queue (event.timeStamp, event.code, true)) {
-        event.preventDefault ();
-    }
+    // `KEYS` rather than the queue's answer, and it is the same question asked
+    // one step earlier: `Input.queue` refuses a code this console has no button
+    // for and reports it, and the page needs that report NOW to decide whether
+    // to take the event away from the browser. One table, read here and drained
+    // there.
+    if (! KEYS [event.code]) { return; }
+
+    wake ();
+
+    post ({ kind: "key", time: event.timeStamp, code: event.code, down: true });
+
+    event.preventDefault ();
 });
 addEventListener ("keyup", event => {
-    if (input.queue (event.timeStamp, event.code, false)) {
-        event.preventDefault ();
-    }
+    if (! KEYS [event.code]) { return; }
+
+    wake ();
+
+    post ({ kind: "key", time: event.timeStamp, code: event.code, down: false });
+
+    event.preventDefault ();
 });
 
 // The pointer, and on the canvas rather than on the window: a click on the HUD
@@ -668,9 +1192,22 @@ function track (event) {
     const pixel = pointerPixel (event.clientX, event.clientY,
         canvas.getBoundingClientRect ());
 
-    input.queuePointer (event.timeStamp, event.pointerId, pixel.x, pixel.y,
-        true, pointerHovers (event));
+    wake ();
+
+    post ({ kind: "pointer", time: event.timeStamp, id: event.pointerId,
+        x: pixel.x, y: pixel.y, present: true, hovers: pointerHovers (event) });
 }
+
+// Every listener the canvas carries, armed on the element that is there now.
+//
+// A FUNCTION RATHER THAN A RUN OF CALLS, because the element is per-run: a
+// canvas is transferable once, so `freshCanvas` below replaces it on every reset
+// and each replacement has to be given the seven listeners the last one had. A
+// list written out at load would have armed the first element and left every
+// element after it deaf, which is a game that cannot be clicked with nothing on
+// the page to say so.
+
+function armCanvas () {
 
 canvas.addEventListener ("pointermove", track);
 canvas.addEventListener ("pointerenter", track);
@@ -686,8 +1223,8 @@ canvas.addEventListener ("pointerdown", event => {
 
     track (event);
 
-    input.queuePointerButton (event.timeStamp, event.pointerId,
-        POINTER_KEYS [event.button], true);
+    post ({ kind: "pointerbutton", time: event.timeStamp, id: event.pointerId,
+        button: POINTER_KEYS [event.button], down: true });
 
     event.preventDefault ();
 });
@@ -695,8 +1232,8 @@ canvas.addEventListener ("pointerdown", event => {
 canvas.addEventListener ("pointerup", event => {
     track (event);
 
-    input.queuePointerButton (event.timeStamp, event.pointerId,
-        POINTER_KEYS [event.button], false);
+    post ({ kind: "pointerbutton", time: event.timeStamp, id: event.pointerId,
+        button: POINTER_KEYS [event.button], down: false });
 });
 
 // The system can take a pointer away - a palm on a phone, an edge gesture, a
@@ -705,12 +1242,14 @@ canvas.addEventListener ("pointerup", event => {
 // cancellation releases both and takes the pointer off the screen.
 canvas.addEventListener ("pointercancel", event => {
     for (const button of POINTER_BUTTONS) {
-        input.queuePointerButton (event.timeStamp, event.pointerId, button,
-            false);
+        post ({ kind: "pointerbutton", time: event.timeStamp,
+            id: event.pointerId, button, down: false });
     }
 
-    input.queuePointer (event.timeStamp, event.pointerId, 0, 0, false,
-        pointerHovers (event));
+    wake ();
+
+    post ({ kind: "pointer", time: event.timeStamp, id: event.pointerId,
+        x: 0, y: 0, present: false, hovers: pointerHovers (event) });
 });
 
 // Absent rather than stale: a pointer that has left the screen has no position,
@@ -718,8 +1257,10 @@ canvas.addEventListener ("pointercancel", event => {
 // While a press is captured this does not fire at all, which is the point of
 // capturing it.
 canvas.addEventListener ("pointerleave", event => {
-    input.queuePointer (event.timeStamp, event.pointerId, 0, 0, false,
-        pointerHovers (event));
+    wake ();
+
+    post ({ kind: "pointer", time: event.timeStamp, id: event.pointerId,
+        x: 0, y: 0, present: false, hovers: pointerHovers (event) });
 });
 
 // The second button reaches the game only if the browser's own menu does not
@@ -727,7 +1268,7 @@ canvas.addEventListener ("pointerleave", event => {
 // over a game that never sees the click would take it from the player for
 // nothing.
 canvas.addEventListener ("contextmenu", event => {
-    if (session && session.controls.pointer !== NEED.none) {
+    if (declaration && declaration.controls.pointer !== NEED.none) {
         event.preventDefault ();
     }
 });
@@ -763,6 +1304,96 @@ canvas.addEventListener ("touchend", event => {
 
     lastTapEnd = event.timeStamp;
 }, { passive: false });
+
+}
+
+// The element the markup carries, so that a page which never reaches a module -
+// a refusal, a fetch that never lands - is still a page whose canvas behaves.
+
+armCanvas ();
+
+// The next run's screen, in place of the one the last run was given.
+//
+// `transferControlToOffscreen` may be called once per element and the
+// `OffscreenCanvas` it answers with goes to one worker and dies with it, so a
+// reset that reused this element would be refused by the browser and a reset
+// that reused the offscreen half has nothing to reuse. Replacing the element is
+// the only door left, and it is a small one: the id carries the stylesheet, the
+// style attribute carries the box `fitCanvas` last computed - width, height,
+// transform and the cursor together, as text, so nothing here has to remember
+// which properties the page writes - and `armCanvas` gives the new element the
+// listeners the old one had.
+
+function freshCanvas () {
+    const next = document.createElement ("canvas");
+
+    next.id = canvas.id;
+    next.width = FRAME_WIDTH;
+    next.height = FRAME_HEIGHT;
+    next.style.cssText = canvas.style.cssText;
+
+    canvas.replaceWith (next);
+
+    canvas = next;
+
+    armCanvas ();
+}
+
+// The picture a replaced renderer left, kept in front of the one that is
+// replacing it.
+//
+// `element` is the canvas the dead renderer was drawing into, already out of
+// the document - `freshCanvas` above put the new one in its place - and still
+// holding the last bitmap its worker committed. This pins it over exactly the
+// box it was occupying and puts it back.
+//
+// `fixed` and the rect it was just measured at, rather than a position in the
+// flow: the element is no longer a flow item and the page must not be made to
+// lay out two canvases to find out where one of them used to be. The transform
+// `fitCanvas` wrote is cleared with it, because the rect already has that
+// correction in it and applying both would move the picture twice.
+//
+// `pointer-events: none` because the game under it is still being played: the
+// listeners are on the element in the flow, and a frozen picture that swallowed
+// a press would be the one thing this must not cost. `image-rendering` is
+// restated inline because the element gives up the id with its place in the
+// document, and a smoothed upscale appearing for a moment is exactly the kind
+// of flicker a frozen frame exists to avoid.
+
+function freeze (element, box) {
+    unfreeze ();
+
+    element.removeAttribute ("id");
+    element.style.position = "fixed";
+    element.style.transform = "none";
+    element.style.left = box.left + "px";
+    element.style.top = box.top + "px";
+    element.style.width = box.width + "px";
+    element.style.height = box.height + "px";
+    element.style.pointerEvents = "none";
+    element.style.imageRendering = "pixelated";
+
+    document.body.appendChild (element);
+
+    frozen = element;
+}
+
+// And taken away again, which happens on the replacement's first picture, on a
+// reset, and on any refit.
+//
+// THE REFIT IS THE ONE THAT IS NOT OBVIOUS. The frozen element is pinned to a
+// box measured in viewport coordinates at one instant, so a window that changes
+// size under it leaves a picture of the right game in the wrong place. A blank
+// canvas for the rest of the window is the better of the two, and a refit is
+// already a moment the page redraws at - so `fitCanvas` drops this rather than
+// moving it, and nothing here has to keep a second box up to date.
+
+function unfreeze () {
+    if (! frozen) { return; }
+
+    frozen.remove ();
+    frozen = null;
+}
 
 // The canvas keeps its 240x240 backing store at every size: only the CSS box
 // changes, and `image-rendering: pixelated` makes the browser's upscale a
@@ -836,6 +1467,11 @@ function fitCanvas () {
     canvas.style.transform = "translate("
         + gridSnap (placed.left, devicePixelRatio) + "px, "
         + gridSnap (placed.top, devicePixelRatio) + "px)";
+
+    // And whatever a replaced renderer left standing over this box, which is
+    // now standing over a box that has moved. `unfreeze` above says why that is
+    // dropped rather than followed.
+    unfreeze ();
 }
 
 // The two rows under the canvas, and whether they are there at all.
@@ -1064,73 +1700,239 @@ if (! document.fullscreenEnabled) { fullButton.hidden = true; }
 
 fullButton.addEventListener ("click", toggleFullscreen);
 
-// The conversion is `paint`, in `player.js`, and so is the running record of
-// which palette entries this run has put on screen; what is left here is the
-// one call a browser is needed for. `putImageData` is therefore the only line
-// of the whole screen path that nothing in `ctest` executes.
-
-function present () {
-    // `seen` is discarded here and the accumulator with it: the running record
-    // of which palette entries a run has drawn had exactly one reader, and it
-    // was the identity row. `plays.js` still carries it - a check comparing
-    // withheld resources against delivered ones needs to know what reached the
-    // screen - which is why `paint` still takes and returns it.
-    paint (session.frame, session.palette, rgba, 0);
-
-    context.putImageData (image, 0, 0);
-}
-
-// What a frame that ran puts on screen. Here rather than inline in the loop
-// because the loop is no longer the only thing that steps the game: entering a
-// pause runs one final frame, and a frame drawn by one caller and not the other
-// would leave the pause showing the frame before it.
-//
-// `held` is the caller saying the pixels already on the canvas are this frame's
-// too, which is `game_report_still` - accumulated over however many steps have
-// run since the last paint, because a run of still frames only reaches back as
-// far as the last frame that was not one. What it saves is `render_video`,
-// `paint` and `putImageData` together, which is the whole screen path: a pass
-// over 57,600 bytes into 230,400 and the upload behind it.
-//
-// It is an OBSERVATION the page may act on rather than an instruction it must
-// obey, and the default says so: a caller with nothing to claim calls `draw ()`
-// and gets the full render. Every path that can invalidate the canvas without
-// the game's state moving takes that call, through `redraw` below.
-
-function draw (held) {
-    if (held) { return; }
-
-    session.renderVideo (session.statePtr, session.videoPtr);
-    present ();
-}
-
 // A full repaint, whatever the last frame claimed. For everything that changes
 // what the canvas is or where it sits without any of it being visible to the
 // game: a refit, entering or leaving fullscreen, the HUD coming and going, and
 // coming back from a pause.
 //
-// None of those is KNOWN to need one. The canvas keeps its 240x240 backing
-// store through every one of them - only writing `width` or `height` clears it
-// - so this is a frame of the screen path spent against a class of failure that
-// is silent, permanent and unreadable here: a page that has stopped painting
-// shows the last thing it painted, and there is no browser in `ctest` to
-// notice. The flag is a claim about the GAME's pixels and says nothing about
-// the browser's, so the page keeps the right to disbelieve it.
-
-function redraw () { if (session) { draw (); } }
-
-// One step's worth of sound, which is the whole of what `game_report_silent`
-// moves. Both callers that step the game go through it, so a report is turned
-// into work in one place rather than in two that can drift apart.
+// A MESSAGE TO THE RENDERER, because the canvas is the render worker's. `paint`,
+// the conversion and `render_video` all run on that thread, so what is left on
+// this page is the request - and it is answered on the message rather than on a
+// frame, because that thread has no frame loop at all: it draws on receipt, and
+// a repaint is a receipt with no new description behind it.
 //
-// The call skipped is `render_audio`, and nothing else: the worklet is fed
-// either way, because a speaker that is handed nothing runs its queue dry and
-// clicks. `Synth.silence` is what that costs, which is a message and no bytes.
+// It is the one message this page sends the renderer after the run is open, and
+// it costs one `render_video` and one write of the canvas over the description
+// that instance is already holding. Nothing is asked of the simulation, which
+// may well be halted while this runs.
+//
+// None of those callers is KNOWN to need it. The canvas keeps its 240x240
+// backing store through every one of them - only writing `width` or `height`
+// clears it, and the page never writes either - so this is a frame of the screen
+// path spent against a class of failure that is silent, permanent and unreadable
+// here: a page that has stopped painting shows the last thing it painted, and
+// there is no browser in `ctest` to notice. The still claim is a claim about the
+// GAME's pixels and says nothing about the browser's, so the page keeps the
+// right to disbelieve it.
 
-function playAudio (report) {
-    if (report & REPORT.silent) { synth.silence (); return; }
+function redraw () { if (render) { render.postMessage ({ kind: "repaint" }); } }
 
-    synth.play (session.renderSamples ());
+// The worklet's own run, opened once the worklet exists: the module's bytes,
+// the addresses the simulation laid down, the regions it laid down once, and
+// the page's end of the channel the simulation is already posting ticks into.
+//
+// It is the LAST thing this page does about sound. After this message the
+// simulation posts every tick straight to the audio thread and no frame of
+// sound crosses this one - which is what the whole change is for, because a
+// main thread stalled by layout, a collection or an extension would otherwise
+// stall the speaker with it.
+//
+// It waits on `synth.ready`, which is `addModule` plus the node, and that wait
+// is why the channel is made in `reset` instead of here: a port holds what is
+// posted to it and carries its queue across the transfer, so the ticks of the
+// wait are heard rather than dropped.
+//
+// A page whose worklet never arrived tells the simulation so, and that is not
+// tidiness: the far end would otherwise go on posting a state block a tick into
+// a port nothing drains, which for `games/suika` is 358 KB a second that
+// nothing ever frees.
+//
+// A `reset` between the two halves is why the worker is captured and compared
+// rather than read twice: the answer belongs to the run that asked, and the run
+// that replaced it has a channel of its own.
+
+// The renderer's own run, opened the moment the simulation says where its arena
+// put things: the module's bytes, those addresses, the regions laid down once,
+// the canvas this page took at `reset`, and the page's end of the channel the
+// simulation is already posting descriptions into.
+//
+// It is the LAST thing this page does about the picture. After this message a
+// description reaches a canvas without this thread being on the path at all,
+// which is what the whole split is for: a renderer that never returns wedges a
+// thread the page can replace, and a main thread stalled by layout, a collection
+// or an extension no longer stalls the drawing with it.
+//
+// It waits on nothing, unlike `openAudio` below it, because there is nothing to
+// wait for: a dedicated worker is ready the moment it is constructed and its own
+// `importScripts` happens on its own thread. So there is no window in which a
+// reset could replace the run underneath this, and no worker to compare.
+//
+// Null for a page that could not take the canvas, which cannot happen - `reset`
+// refuses that browser by name rather than playing on blind.
+
+function openRender (layout, regions) {
+    if (! render || ! screenPort) { return; }
+
+    // The BYTES rather than the compiled module, for the reason the worklet
+    // gets bytes: one spelling for "a consumer compiles its own instance", and
+    // the page is holding them anyway because `declaration` compiles from them.
+    // The trampoline is the compiled module, which does clone to a dedicated
+    // worker, exactly as the simulation is handed it.
+    render.postMessage ({
+        kind: "open",
+        bytes: wasmBytes,
+        trampoline,
+        layout,
+        resident: regions,
+        canvas: screenHandle,
+        port: screenPort,
+    }, [screenHandle, screenPort]);
+
+    // Both are spent: a canvas handle and a port belong to the thread they were
+    // transferred to, and this page has nothing left to do with either.
+    screenHandle = null;
+    screenPort = null;
+}
+
+// Everything the renderer says, which is two things and both of them
+// heartbeats: it is open, and it has drawn.
+//
+// It says nothing else and is asked nothing, which is the shape the whole split
+// bought. The simulation posts descriptions straight down a channel this page is
+// not on, the renderer paints them into a canvas this page gave away, and what
+// crosses back here is the one fact a page needs about another thread: that it
+// is still there. `RenderWatch` in `player.js` is what reads both.
+//
+// A message from a renderer this page has replaced never arrives, for `fromSim`'s
+// own reason one thread over: the outgoing thread is terminated before the new
+// one is built, so there is no answer in flight to attribute to the wrong
+// worker.
+
+function fromRender (message) {
+    switch (message.kind) {
+
+    // The instance is compiled, the canvas is in hand and the channel is being
+    // listened to. Nothing has been drawn, and that is the point: this is what
+    // makes a renderer that never draws ONCE reportable.
+    case "ready":
+        renderWatch.opened ();
+
+        break;
+
+    // A picture landed, and this is the frame it was drawn from.
+    case "drew":
+        renderWatch.drew (message.frame);
+
+        // And the last good frame of the renderer this one replaced, taken
+        // down: there is a live picture under it now. The first draw rather
+        // than the `ready` above, because a renderer that is open has still
+        // drawn nothing - the window this covers is exactly from the wedge to
+        // the first new picture, which is what it costs.
+        unfreeze ();
+
+        break;
+    }
+}
+
+// The renderer stopped answering while the simulation went on publishing, so it
+// is ended and another is built behind the picture it left.
+//
+// THIS IS WHAT THE DISPLAY FRAME BOUGHT. A `render_video` that never returns
+// used to take the run with it, because it ran on the thread that steps: the
+// page's watchdog terminated the simulation and the session was over.
+// `docs/archived/render-worker-plan.md` traded one display frame of latency for
+// a renderer the page can replace, and this function is the whole of the second
+// half of that trade.
+//
+// THE SIMULATION IS NEVER TOUCHED, and that is the gate the plan states rather
+// than a nicety: it is not terminated, not reset, not paused and not asked
+// anything, so its frame count goes on advancing across every line below. The
+// one message it is sent is `viewer`, which is the message it already has for
+// being told where to publish - and it is sent for a reason that is not
+// bookkeeping. The thread on the far side of the old port is gone, and the
+// simulation's record of which task blocks that consumer holds would otherwise
+// keep every live block from ever being delivered to the new one;
+// `sim.worker.js`'s own `viewer` case says what that would cost.
+//
+// THE ORDER IS THE ONE `seize` KEEPS, for the same reason: the wedged thread is
+// ended first, because everything after it takes time a page whose main thread
+// is fine can afford and a spinning core is not.
+//
+// A FRESH ELEMENT, because a canvas may be transferred once and the handle the
+// old one gave away died with its worker. `freeze` above is what the player
+// sees while the new one is still empty.
+
+function replaceRenderer () {
+    if (! sim || ! render || ! arena) { return; }
+
+    // Measured before the element leaves the document, because a box is a fact
+    // about where it was laid out and there is no reading it afterwards.
+    const box = canvas.getBoundingClientRect ();
+    const shown = canvas;
+
+    render.terminate ();
+
+    freshCanvas ();
+    freeze (shown, box);
+
+    screenHandle = canvas.transferControlToOffscreen ();
+
+    // And a new channel, in both directions, exactly as `reset` makes the
+    // first: the simulation starts publishing into it at once and the port
+    // holds what the new worker has not drained, so the frames drawn while it
+    // fetches and compiles are drawn rather than dropped.
+    const channel = new MessageChannel ();
+
+    screenPort = channel.port1;
+
+    sim.postMessage ({ kind: "viewer", port: channel.port2 },
+        [channel.port2]);
+
+    render = new Worker (new URL ("render.worker.js", location.href).href);
+
+    render.onmessage = (event) => fromRender (event.data);
+
+    // Before the worker is opened rather than after, so that nothing can arrive
+    // from it against a watch that still believes the dead thread's numbers.
+    renderWatch.replace ();
+
+    openRender (arena.layout, arena.resident);
+
+    // Said once, on the console, and said as a warning rather than an alarm:
+    // the run is still playing and a banner over it would be the page reporting
+    // a failure the player cannot see and does not have. What a person does
+    // want, if they ever read this, is the frame it happened on.
+    console.warn ("player: the renderer stopped answering while it was drawing "
+        + `frame ${renderWatch.shown}, so it was replaced. The simulation was `
+        + "not interrupted. A second one ends the run.");
+}
+
+async function openAudio (layout, regions) {
+    const worker = sim;
+    const port = audioPort;
+
+    audioPort = null;
+
+    if (! port) { return; }
+
+    if (synth) { await synth.ready; }
+
+    // A run replaced while this waited: the thread on the far end has been
+    // terminated, so there is nobody left to tell and nothing to close but this
+    // end of a channel that can no longer carry anything.
+    if (worker !== sim) { port.close (); return; }
+
+    // No worklet, for any of the reasons `Synth.start` catches - and the
+    // simulation is TOLD, rather than left posting into it.
+    if (! synth || ! synth.node) {
+        port.close ();
+
+        worker.postMessage ({ kind: "audience", port: null });
+
+        return;
+    }
+
+    synth.open (wasmBytes, trampolineBytes, layout, regions, port);
 }
 
 // Mark: the playtest hook from the design. Packages the frame index, the
@@ -1140,126 +1942,208 @@ function playAudio (report) {
 // Mark, Reset and Pause are all live in the DOM before a module is, because the
 // page is built once and every game hangs off it. Each answers for the run
 // there is not yet, rather than for a null session.
+//
+// TWO HALVES STILL, and the seam is the browser rather than the thread. What a
+// recording is made of - the seed the run really used, the pairs it was told,
+// the blob it was constructed from and the four logs - reaches this page as the
+// run goes along and is held in `runRecord` below; `markText` in `player.js`
+// composes the file out of it, because that is arithmetic over a format and
+// needs no browser; and what is left here is the two calls that put text in a
+// person's downloads.
+//
+// IT WAS A ROUND TRIP and is not, and the reason is the watchdog. Mark used to
+// post a question and write what came back, which is correct for a page whose
+// simulation is answering and useless for the one case a recording is most
+// wanted in: a `step` that never returns answers no message, so the moment the
+// page most needs the input log was the moment it could not ask for it. Holding
+// the record removes the question, which also removes the token that paired an
+// answer with it - a player leaning on `M` now writes one file per press with no
+// reply to lose track of.
+
 function mark () {
-    if (! session) { return; }
+    if (! declaration || ! runRecord) { return; }
 
-    // Space separated lines rather than JSON: the readers are C and this file,
-    // and a line format costs six lines here while saving a hand written JSON
-    // parser on the other side - the code standing between a corrupt replay and
-    // a silently wrong one. Readers split on the first run of whitespace, so a
-    // value may contain spaces and no quoting rule is needed.
-    //
-    // The `seed` line is the number this run really used: the address carries
-    // it by the time a frame has been drawn, whether a reader wrote it or
-    // `composeRun` rolled it, so a recording reproduces a run rather than
-    // re-rolling it - by construction rather than by a rule somebody has to
-    // remember.
-    //
-    // Then one `arg <name> <value>` line per pair this run passed through,
-    // sorted by name, which is the order they were delivered in - a recording
-    // and a delivery are one list, so a reader on another machine produces the
-    // same bytes and the same array. An EMPTY value is the name with nothing
-    // after it, which is the format's own spelling for the one value that is
-    // not absence, and a bare run writes no `arg` line at all - a reader that
-    // finds none supplies none.
-    //
-    // The `save` line between them carries the blob this run was CONSTRUCTED
-    // from, and only where that blob had a non-zero byte. It is what was
-    // delivered rather than a reference to the store it came out of, so a mark
-    // taken here reproduces on a machine whose `localStorage` holds something
-    // else or nothing at all - and a run handed nothing writes no line, which
-    // is why every replay in this tree older than the record is still valid
-    // unchanged. `Session.saveLines` holds both halves of that rule.
-    const lines = [
-        `game ${session.name}`,
-        `version ${session.version.join (".")}`,
-        `seed ${session.seed}`,
-        ...session.saveLines (),
-        ...session.argLines (),
-        `frame ${session.frameIndex}`,
-    ];
-    // Merged by frame rather than one log after the other. Both readers keep a
-    // cursor per record kind, so either order parses - but a file read by a
-    // person should run forwards in time.
-    //
-    // A task's answer is recorded beside the buttons because it is the same
-    // kind of thing: an edge at a frame boundary that the game branches on. The
-    // game SAMPLES a level rather than catching that edge, but the frame the
-    // level changes on is still the host's decision, so a replay that left it
-    // out would reproduce the run with the answers never arriving,
-    // deterministically and wrongly. A failure is recorded for the stronger
-    // version of that reason - an absence cannot be pinned at all, so a run
-    // where a task never answered is replayable only as a record.
-    //
-    // By ID rather than by name, and nothing else about a task goes in: a
-    // descriptor carries a name nothing resolves through, and the spawn
-    // re-fires from the same state on the same frame - so a replay runs the
-    // body again and regenerates the output rather than carrying a
-    // computation's answer in a file meant to outlive the build that made it.
-    //
-    // A RESOURCE has no record of its own here and never will: a body reads a
-    // file off the frame and a replay re-runs the body, so there is no schedule
-    // to reproduce. What pins the bytes is the identity a completion carries -
-    // the filename the host handed the body, its length and a fold of it.
-    //
-    // Every record this page writes says `none` there, which is the format's
-    // spelling for "this record pins no delivery", and it is honest rather than
-    // lazy: the page FETCHES over HTTP and holds decoded bytes rather than
-    // files it read, so it has nothing to fold and no filename to fold it
-    // under. A reader cannot tell that from a body that was handed no file, and
-    // is not meant to - both mean there is nothing here to check against. So a
-    // recording taken here replays and verifies nothing about its resources,
-    // which is exactly what the page could say about them before.
-    //
-    // The pointer is here for the first reason and is written as a change, like
-    // `input`: a position is piecewise constant, so a record means "here from
-    // this frame until the next one". Leaving the screen is written as `away`
-    // rather than as a position nobody is at, because absence is a thing the
-    // reader has to reproduce and every coordinate on the screen is a legal one.
-    const records = [
-        ...session.inputLog.map (e =>
-            ({ frame: e.frame, kind: "input", text: e.buttons.join (" ") })),
-        ...session.tapLog.map (e =>
-            ({ frame: e.frame, kind: "tap", text: e.buttons.join (" ") })),
-        ...session.taskLog.map (e =>
-            ({ frame: e.frame, kind: e.kind, text: `${e.id} none` })),
-        ...session.pointerLog.map (e => ({ frame: e.frame, kind: "pointer",
-            text: e.present ? `${e.x} ${e.y}` : "away" })),
-    ].sort ((x, y) => x.frame - y.frame);
+    writeMark (runRecord);
+}
 
-    for (const record of records) {
-        lines.push (`${record.kind} ${record.frame}`
-            + (record.text ? ` ${record.text}` : ""));
-    }
+// The record as a file, downloaded. `frameIndex` is what the run reached, so a
+// mark taken by a player names the frames that RAN - and the watchdog hands this
+// a record whose count is one higher, because a recording that stops short of
+// the frame that wedged reproduces everything except the hang.
 
-    const blob = new Blob ([lines.join ("\n") + "\n"], { type: "text/plain" });
+function writeMark (record) {
+    const blob = new Blob (
+        [markText (declaration.name, declaration.version, record)],
+        { type: "text/plain" });
     const a = document.createElement ("a");
     a.href = URL.createObjectURL (blob);
-    a.download = session.name.toLowerCase () + "-mark-" + session.frameIndex + ".replay";
+    a.download = declaration.name.toLowerCase () + "-mark-" + record.frameIndex
+        + ".replay";
     a.click ();
     URL.revokeObjectURL (a.href);
+}
+
+// The run is over, so it is ended and said out loud.
+//
+// `docs/decisions.md` pending item 10, in the four things it asks for: the frame
+// is named, the worker is terminated, the recording goes out in Mark's own
+// format, and the report names the command that reproduces it natively.
+// `Watchdog` in `player.js` decides WHEN, and everything here is what only a
+// browser can do about it.
+//
+// TWO CALLERS AND TWO SENTENCES, which is why the reason and the frame count
+// are passed in rather than composed here. A simulation that stopped answering
+// is named by `stallLine` and reproduced one frame PAST what it reported
+// finishing, because the frame it reported finishing is the one before the
+// frame it stopped in. A renderer that stopped answering for the second time in
+// a session is named by `renderStallLine` and reproduced AT the frame the
+// picture was owed for, with no offset, because that description is what
+// wedged and a recording that ran on past it would render the wrong one. The
+// two numbers are different arithmetic over different threads, so each caller
+// brings its own.
+//
+// The order matters in one place and one only: the thread is ended first,
+// because everything after it takes time a page whose main thread is fine can
+// afford and a spinning core is not. `terminate` on a thread spinning inside
+// wasm is measured rather than assumed - it resolves in about 2 ms under node,
+// and `products/web-player/tests/watchdog.js` asserts the exit rather than
+// trusting it.
+//
+// The sound goes with it. `render_audio` runs in the worklet on states this
+// thread no longer receives, so a processor left running would play its queue
+// out and then 800 zeros a tick for ever; suspending is what a halt already does
+// for a game that stopped for a better reason.
+//
+// AND THE PICTURE, for the same reason and with nothing to suspend: the renderer
+// is a thread holding a canvas and an instance of a game that no longer runs, so
+// it is ended rather than left. The last frame it drew stays on screen, which is
+// what a person reading the banner over it should see - and where a renderer was
+// replaced and then stopped again, the frame left standing is the FROZEN one
+// `freeze` above put there, because the canvas under it belongs to a
+// replacement that never drew. So `unfreeze` is deliberately not called here:
+// dropping it would answer a run that ended with a black square.
+//
+// AND THE FILE MAY BE REFUSED, which is worth writing down rather than
+// discovering. A browser may decline a download that no gesture asked for, and
+// nothing here is a gesture - a frame callback noticed the silence. What makes
+// that survivable is that the record is the page's: `M` still works after this,
+// because there is no worker left to ask and there never needed to be one.
+
+function seize (reason, frames) {
+    sim.terminate ();
+    sim = null;
+
+    if (render) { render.terminate (); render = null; }
+
+    stopLoop ();
+
+    if (audioPort) { audioPort.close (); audioPort = null; }
+
+    if (screenPort) { screenPort.close (); screenPort = null; }
+
+    if (synth && synth.ctx) { synth.ctx.suspend (); }
+
+    showAlarm (reason);
+
+    console.error ("player: " + reason);
+
+    // The frames the recording asks for, which its caller worked out: the
+    // block above says why the two callers cannot share one number.
+    //
+    // The record is moved on rather than a copy of it written, so that pressing
+    // `M` after this writes the same file the page just wrote. A player who
+    // never saw the download - a browser may decline one no gesture asked for -
+    // must not get a recording one frame short of the only frame that matters.
+    if (runRecord) {
+        runRecord.frameIndex = frames;
+
+        writeMark (runRecord);
+    }
 }
 
 function reset () {
     if (! wasmBytes) { return; }
 
-    // What the outgoing session leaves behind, in the order the two have to
+    // What the outgoing run leaves behind, in the order the three have to
     // happen in.
     //
     // Its store first, because a reset is a new run rather than a lost one: the
     // game about to be built reads that store back in `construct`, so without
     // this a player who pressed R and then closed the tab would have the reset
-    // run recorded and the run before it forgotten.
+    // run recorded and the run before it forgotten. Written out of the blob the
+    // outgoing run's last stepped frame carried, which is what makes it possible
+    // at all here: the thread that could render one is about to be terminated,
+    // and a page that had to ask it for a blob first would be asking across a
+    // round trip it does not have.
     //
-    // Then every worker it is still holding - one per body in the air - because
-    // a thread running a body for a game that no longer exists is a core spent
-    // on an answer nothing will read, and its message would reach a linear
-    // memory nothing is playing out of.
-    if (session) {
-        session.writeSave ();
+    // Then the simulation's own thread, and every worker it is still holding -
+    // one per body in the air - because a thread running a body for a game that
+    // no longer exists is a core spent on an answer nothing will read, and its
+    // message would reach a linear memory nothing is playing out of. `close`
+    // asks for the bodies and `terminate` takes the thread: the first is the
+    // session's own `runner.stop`, and the second is what makes a reset a new
+    // linear memory on the far side as well as this one.
+    //
+    // And the renderer with it, in the same two moves and for a third reason
+    // besides: it holds this run's canvas, and a canvas may be transferred once
+    // per element - so a reset is a new element, a new handle and therefore a
+    // new thread to hand it to, whatever else it is.
+    writeSave ();
 
-        session.runner.stop ();
+    if (sim) {
+        sim.postMessage ({ kind: "close" });
+        sim.terminate ();
+        sim = null;
     }
+
+    if (render) {
+        render.postMessage ({ kind: "close" });
+        render.terminate ();
+        render = null;
+    }
+
+    // And this page's ends of the outgoing run's two channels, if the worklet
+    // and the renderer never took them. The other ends went into a thread that
+    // has just been terminated, so nothing will ever post to them again.
+    if (audioPort) { audioPort.close (); audioPort = null; }
+
+    if (screenPort) { screenPort.close (); screenPort = null; }
+
+    // And what the outgoing run would have kept, which has just been written and
+    // belongs to a game that no longer exists.
+    keptSave = null;
+
+    // And the things that belong to the outgoing run rather than to the page:
+    // what it would have been recorded as, the two waits for answers it is no
+    // longer owed, where its arena put things, and the last picture it drew if
+    // its renderer had been replaced. A watchdog carried across a reset would
+    // count the silence of a thread that has been terminated on purpose, and a
+    // replacement already spent would be spent against the wrong run.
+    runRecord = null;
+    watchdog = new Watchdog ();
+    renderWatch = new RenderWatch ();
+    arena = null;
+
+    unfreeze ();
+
+    gameModule = new WebAssembly.Module (wasmBytes);
+
+    declaration = new Consumer (gameModule, null);
+
+    // The STORE is the one thing here that outlives the page, and it stays on
+    // this side of the worker because it has to: `localStorage` does not exist
+    // on a worker's thread. So the page reads it and hands the blob over with
+    // everything else the run was told, and the page writes it back out of the
+    // blob the simulation pushes with every frame that stepped - which is what
+    // makes a save on `pagehide` possible with no round trip left to take.
+    //
+    // Null where this browser has storage turned off, which is a page that plays
+    // and forgets rather than a page that refuses, and null for a game that
+    // persists nothing - `Session` then hands `construct` the null
+    // `interface/game.h` names for that case and for no other.
+    const saved = saveStore && declaration.saveSize
+        ? saveStore.read (declaration.name, declaration.saveSize)
+        : null;
 
     // The worker's URL is the PLAYER's rather than the module's, exactly as the
     // decoder's is and for the same reason: one page plays every game, so a
@@ -1284,26 +2168,109 @@ function reset () {
     // new linear memory - which is what keeps laying them down once per session
     // from leaking.
     //
-    // The STORE is the one thing here that outlives the page, and it is handed
-    // over rather than reached for by `Session` so that every other host in the
-    // tree gets a session with none: `goldenhash.js`, `plays.js` and every
-    // replay construct from zeros and write nothing, which is what keeps a test
-    // run from moving anybody's browser. Null where this browser has storage
-    // turned off, which is a page that plays and forgets rather than a page
-    // that refuses.
-    session = new Session (wasmBytes, trampoline, new HostCore (core), runSeed,
-        runArguments,
-        new URL ("task.worker.js", location.href).href,
-        { base: resourceDirectory.href },
-        saveStore);
+    // AND THE THREAD IT ALL HAPPENS ON. `sim.worker.js` builds the `Session`
+    // out of exactly what used to be passed here, one message along, and answers
+    // with the addresses its arena laid down; nothing about what a session is
+    // told has moved, only where it is told it.
+    //
+    // The module's bytes rather than the compiled module, and the two compiled
+    // ones beside them because they already are: `fetchModule` answers bytes
+    // and `fetchTrampoline` and `fetchCore` answer modules, and a
+    // `WebAssembly.Module` clones to a dedicated worker because the two share an
+    // agent cluster - measured in
+    // `docs/archived/unified-tasks-phase0/probes.md` section 1. The page keeps
+    // the bytes because `declaration` above compiles from them.
+    sim = new Worker (new URL ("sim.worker.js", location.href).href);
 
-    // The other half of what ends a rest, and the half a game cannot cause: a
-    // task becomes ready under a game whose state had no other reason to move,
-    // so a page asleep on that game's promise would sleep through the one thing
-    // it was waiting for. Assigned per session because `reset` builds a new one,
-    // and a stale session's answers reach a linear memory nothing is playing out
-    // of any more.
-    session.onStaged = wake;
+    sim.onmessage = (event) => fromSim (event.data);
+
+    // And the thread that draws, started here beside it and opened later: what
+    // a renderer has to be told is where the simulation's arena put things, and
+    // that is not known until the simulation answers. Started now all the same,
+    // because starting a worker is a fetch and a compile and both are round
+    // trips this run may as well spend while the session is being built.
+    render = new Worker (new URL ("render.worker.js", location.href).href);
+
+    render.onmessage = (event) => fromRender (event.data);
+
+    // AND THE SCREEN, taken here and handed to that thread when it is opened.
+    //
+    // A fresh element every run, and always rather than only after the first:
+    // `transferControlToOffscreen` may be called once per element and the handle
+    // it answers with goes to one worker and dies with it, so the branch that
+    // spared the markup's own canvas on the first run would exist only to be got
+    // wrong later. `freshCanvas` carries the CSS box and the listeners across.
+    //
+    // Refused rather than played around, because a page that cannot hand the
+    // canvas over cannot show the game at all and nothing else on it would say
+    // so - the run would step, sound and record with a blank screen. Both
+    // browsers the arcade is played in were measured to have it,
+    // `docs/runs/drawing-worker-run.md` (c).
+    freshCanvas ();
+
+    if (! canvas.transferControlToOffscreen) {
+        refuse ("this browser will not hand a canvas to a worker, and this "
+            + "player draws every frame on a thread of its own. There is "
+            + "nothing on this page that could paint instead.");
+    }
+
+    screenHandle = canvas.transferControlToOffscreen ();
+
+    sim.postMessage ({
+        kind: "open",
+        bytes: wasmBytes,
+        trampoline,
+        core,
+        seed: runSeed,
+        args: runArguments,
+        workerUrl: new URL ("task.worker.js", location.href).href,
+        resources: { base: resourceDirectory.href },
+        saved,
+
+        // Which zero this page's timestamps stand on. A dedicated worker's
+        // clock counts from its own creation, so `performance.now ()` there and
+        // `event.timeStamp` here are the same unit and not the same zero - and
+        // the queue the worker drains is stamped with the second. One number,
+        // sent once, and the worker subtracts: it is exact where the estimate
+        // the retired phase-locked clock kept was a model.
+        pageTimeOrigin: performance.timeOrigin,
+
+        // Whether the worker may start asking the display for frames at all.
+        // A tab opened into the background is already hidden, and a run built
+        // behind a pause is already paused - and the halt table below cannot
+        // tell the worker so until it exists, so the first word it is given is
+        // the state it is being born into.
+        running: ! halted (halt),
+    });
+
+    // The channel the sound will take, made here and given away in two
+    // directions: one end goes to the simulation now, and the other to the
+    // worklet as soon as there is one. From then on a tick reaches the speaker
+    // without this thread being involved at all, which is the property a page
+    // relaying every frame would have thrown away.
+    //
+    // Before the first tick rather than after the worklet is ready, because a
+    // port holds what is posted to it and carries its queue across the
+    // transfer: the frames a run sounds while `addModule` resolves are heard.
+    const channel = new MessageChannel ();
+
+    audioPort = channel.port1;
+
+    sim.postMessage ({ kind: "audience", port: channel.port2 },
+        [channel.port2]);
+
+    // And the channel the PICTURE will take, made the same way and for the same
+    // reason: the simulation starts posting descriptions into it at once, and
+    // the renderer takes the queue with the port when `openRender` hands it
+    // over. Two channels rather than one, because the two consumers are told
+    // different things at different cadences and a shared port would make each
+    // of them read past the other's messages.
+    const screenChannel = new MessageChannel ();
+
+    screenPort = screenChannel.port1;
+
+    sim.postMessage ({ kind: "viewer", port: screenChannel.port2 },
+        [screenChannel.port2]);
 
     describe ();
 
@@ -1312,6 +2279,129 @@ function reset () {
     // unpausing, and a reset behind a menu is still behind it - but a game that
     // no longer exists cannot be the reason the loop is stopped.
     wake ();
+}
+
+// Everything the simulation says, which is three things: the arena it laid down,
+// a tick's worth of work, and a task that has become ready. A recording used to
+// be a fourth and is not, because the page holds one rather than asking for it -
+// `mark` above says why, and the answer is a thread that cannot answer.
+//
+// A message from a worker this page has replaced never arrives, and that is
+// `reset`'s doing rather than a check here: the outgoing thread is terminated
+// before the new one is built, so there is no answer in flight to attribute to
+// the wrong run. It is the same sentence `Session.onStaged` carries one thread
+// over, kept by the same move - ending the thread rather than filtering what it
+// says.
+
+function fromSim (message) {
+    switch (message.kind) {
+
+    case "opened":
+        // What a recording says before its first record, and the only part of
+        // one that cannot change: the seed the run really used, the blob it was
+        // constructed from and the pairs it was told. It is also what says a run
+        // has opened at all, which is what the frame case below reads.
+        runRecord = openRecord (message);
+
+        // And what this run would keep before it has stepped at all, which is
+        // the one blob no game asks for: `construct` may have rewritten a field
+        // on the way in, and a tab closed before the first request has to write
+        // those bytes rather than the ones the store already held. Kept exactly
+        // as a frame's is, through the same slot, so nothing below this can tell
+        // which message a blob arrived on.
+        if (message.save) { keptSave = message.save; }
+
+        // The addresses the simulation laid down and the regions it laid down
+        // once, to BOTH consumers: each is an instance of the same module
+        // rendering the same bytes, one thread over, and each needs both
+        // because a renderer may follow a pointer into the argument storage,
+        // the save blob or a task's output, which is
+        // `interface/game.h:34-44`'s list.
+        //
+        // The renderer first, because it is the one with a person waiting on
+        // it: the sound waits on `addModule` either way, and a frame drawn
+        // sooner is the whole of what the argument about this player's latency
+        // has ever been about.
+        //
+        // KEPT AS WELL AS SPENT, because a renderer this page has to REPLACE
+        // is told exactly what this one is being told and the thread that
+        // knows it must not be interrupted to ask. `arena` above prices what
+        // holding it costs.
+        arena = { layout: message.layout, resident: message.resident };
+
+        openRender (message.layout, message.resident);
+        openAudio (message.layout, message.resident);
+
+        break;
+
+    case "frame": {
+        if (! runRecord) { break; }
+
+        // The simulation is alive and this is where it has got to. First,
+        // because what this clears is a wait: a frame message arrives once per
+        // display frame whatever else it carries, and a frame that owed no step
+        // sends one for exactly this reason.
+        watchdog.answered (message.frame);
+
+        // And whether this tick published a PICTURE, which is `present`'s own
+        // two skips read off the message it already sends: a tick that stepped
+        // and did not claim `game_report_still`. It is the other half of what
+        // the render watchdog needs - a renderer owes a draw for exactly the
+        // frames the simulation published one for, and for a resting game, a
+        // still frame or a halted page that is none of them.
+        if (message.stepped && ! message.held) {
+            renderWatch.published (message.frame);
+        }
+
+        // And what the run would be recorded as, one frame longer. The entries
+        // are the ones the simulation's logs grew by, so this is a push of
+        // nothing on almost every frame.
+        growRecord (runRecord, message.frame, message.records);
+
+        // And what it would keep, as of the newest frame the game asked to be
+        // saved on. Held rather than written, because `watchStore` decides when
+        // a host saves and this is not one of its moments; and a frame carrying
+        // none leaves the last one standing, which is what makes this a mailbox
+        // rather than a log.
+        if (message.save) { keptSave = message.save; }
+
+        // The frame a pause costs has been published, so the sound may now stop.
+        // `setHalt` held it back for exactly this: the audio context is
+        // suspended after the last frame it is owed rather than before it.
+        //
+        // OWED rather than heard, and that was already the case before the
+        // worklet rendered: the queue on the far side is up to three ticks deep,
+        // so what a suspend cuts off is whatever of them had not reached the
+        // speaker. What changed is only which side the arithmetic happens on.
+        if (message.pointerAway && quietWhenPublished) {
+            quietWhenPublished = false;
+
+            // The state is read again rather than trusted, exactly as
+            // `AUDIO_GRACE`'s timer reads it: a player who paused and resumed
+            // faster than a message round trip is a page that has already been
+            // told to start the sound, and stopping it here would silence a run
+            // that is playing.
+            if (synth && halted (halt)) {
+                cancelAudioRest ();
+                synth.ctx.suspend ();
+            }
+        }
+
+        // The game says nothing more is coming until something happens to it,
+        // and nothing has - `Clock.advance` on the far side holds the two things
+        // that can already have happened by the time this is read. What is left
+        // here is the flag, which is the page's because everything it stops is.
+        if (message.idle) { setHalt ({ idle: true }); }
+
+        break;
+    }
+
+    // A task became ready under a game whose state had no other reason to move.
+    case "wake":
+        wake ();
+
+        break;
+    }
 }
 
 // The one place the game's declared colour becomes the page's. `theme` is in
@@ -1327,7 +2417,7 @@ function reset () {
 // dark chrome and says so in `--alarm` rather than on whatever the game wanted.
 
 function applyTheme () {
-    const colours = theme (session.palette, session.background);
+    const colours = theme (declaration.palette, declaration.background);
     const root = document.documentElement;
 
     for (const [name, value] of Object.entries (colours)) {
@@ -1365,12 +2455,13 @@ function describe () {
     // the row that showed the rest is gone: the tab still carries the name and
     // the version, which is the one place a person can tell two games apart
     // without playing them.
-    document.title = `${session.name} ${session.version.join (".")}`;
+    document.title =
+        `${declaration.name} ${declaration.version.join (".")}`;
 
     applyTheme ();
     applyCursor ();
 
-    fillLegends (legendRow, session.controls, document);
+    fillLegends (legendRow, declaration.controls, document);
 }
 
 // A cursor the browser draws is on screen and NOT in the framebuffer, so it is
@@ -1387,7 +2478,8 @@ function describe () {
 
 function applyCursor () {
     canvas.style.cursor =
-        session && ! halt.paused && session.controls.pointer !== NEED.none
+        declaration && ! halt.paused
+            && declaration.controls.pointer !== NEED.none
             ? "none"
             : "";
 }
@@ -1462,28 +2554,20 @@ function cancelAudioRest () {
 // is already off the screen: the frame exists to change what the game sees, and
 // there it would change nothing.
 
+// The queue, the release and the step are all the simulation's now, so what is
+// left here is the request - `sim.worker.js`'s `shed` case is the other half,
+// and it answers with an ordinary frame carrying `pointerAway`. That answer is
+// drawn and heard exactly as any other, which is what "it costs one real frame"
+// has always meant.
+//
+// The ORDER is what the page has to keep, and it is the reason this is not
+// fire-and-forget. Suspending the audio context before that frame's samples had
+// been handed over would drop them, so `setHalt` sets `quietWhenPublished` and
+// `fromSim` is what finally stops the sound. Nothing else a halt does waits on
+// anything.
+
 function stepPointerAway () {
-    if (session.controls.pointer === NEED.none) { return; }
-
-    // Drained first, or the release below is applied and then immediately
-    // overwritten by whatever the queue was still holding.
-    input.applyUpTo (Infinity);
-
-    if (! input.pointer.present) { input.clearEdges (); return; }
-
-    input.releasePointer ();
-
-    const report = session.advance (input.buttons, input.edges, input.pointer);
-
-    input.clearEdges ();
-
-    // Honoured here as in the loop, and for one reason rather than for
-    // symmetry: this frame exists to take the game's own cursor off the screen,
-    // so a game that draws one reports pixels that moved and is painted, and a
-    // game that draws none reports `game_report_still` and has nothing for the
-    // page to paint. Either way the claim is about the frame that just ran.
-    playAudio (report);
-    draw (report & REPORT.still);
+    post ({ kind: "shed", how: "stepped" });
 }
 
 // The one writer of all three flags. Idempotent by construction, since
@@ -1504,8 +2588,8 @@ function setHalt (change) {
     //
     // `idle` is the loop's reading of a game, and every one of these
     // transitions moves something that reading was taken under: the pointer
-    // `stepPointerAway` sends away, the buttons `shedInput` drops, the frames a
-    // hidden tab never ran. Re-deriving it costs one step of a game that is
+    // `stepPointerAway` sends away, the buttons a `quiet` shed drops, the frames
+    // a hidden tab never ran. Re-deriving it costs one step of a game that is
     // about to be stepped anyway.
     //
     // It also closes the one way this could strand a run. `halted` is the OR of
@@ -1539,7 +2623,7 @@ function setHalt (change) {
     // offering to undo something the player never did.
     pauseButton.textContent = halt.paused ? "Resume (Enter)" : "Pause (Enter)";
 
-    if (! session || ! synth) { return; }
+    if (! sim || ! synth) { return; }
 
     // Before anything stops, because a halted loop is exactly what would swallow
     // the frame `stepPointerAway` runs.
@@ -1552,18 +2636,27 @@ function setHalt (change) {
     // one burst on the first frame back. A game that was merely RESTING is
     // deliberately not in this list: nothing was taken from the player there,
     // and the press that woke it is the press it is owed.
-    if (shed === "stepped") { stepPointerAway (); }
-    else if (shed === "quiet") { shedInput (); }
-    else if (shed === "backlog") {
-        input.applyUpTo (Infinity);
-        input.clearEdges ();
+    // The one of the three that runs a real frame is also the one whose answer
+    // comes back later, so the sound is held off until it does. A game that
+    // reads no pointer and a pointer already off the screen both answer with no
+    // frame at all - the worker decides that, because the queue is there - so
+    // the flag is armed either way and cleared by whichever comes first, that
+    // frame or the next halt.
+    if (shed === "stepped") {
+        quietWhenPublished = sound === "stop";
+
+        stepPointerAway ();
     }
+    else if (shed) { post ({ kind: "shed", how: shed }); }
 
     applyCursor ();
 
     // Emitting nothing means sustain, so a game that stops stepping mid-note
     // would drone on. Suspending stops the worklet outright.
-    if (sound === "stop") { cancelAudioRest (); synth.ctx.suspend (); }
+    if (sound === "stop" && ! quietWhenPublished) {
+        cancelAudioRest ();
+        synth.ctx.suspend ();
+    }
 
     // A game resting is the one halt the sound leaves slowly - `AUDIO_GRACE`
     // above holds why, and what the number is a judgement between.
@@ -1593,7 +2686,35 @@ function setHalt (change) {
     // reason, as the fullscreen key that used to spend the activation.
     if (sound === "start") { cancelAudioRest (); synth.resume (); }
 
-    if (run === "stop") { stopLoop (); }
+    if (run === "stop") {
+        stopLoop ();
+
+        // And the wait for an answer the page has stopped asking for. A halted
+        // page posts no timestamps, so what would be left behind is one pending
+        // one, ageing through a pause or a hidden tab and reported as a hang the
+        // moment the player came back. `Watchdog` in `player.js` carries the
+        // background-tab reading that makes this the difference between a
+        // watchdog and a nuisance.
+        //
+        // AND THE RENDERER'S, which has one of the two halves of its own rule
+        // already: a halted page publishes no picture, so nothing new is ever
+        // owed while the game is stopped. What it can be left holding is a
+        // picture that WAS owed at the instant the halt arrived, ageing through
+        // a pause or a hidden tab and read as a wedge the moment the player
+        // comes back. The wait goes; the debt stays, so a renderer that really
+        // did stop is still reported on the first frame after the resume.
+        watchdog.disarm ();
+        renderWatch.disarm ();
+
+        // And the worker's own clock with it, which IS the halt now: the page
+        // steps nothing, so a halt that did not reach the worker would leave a
+        // game running for a player who is not there. It is load bearing rather
+        // than tidy - `docs/runs/drawing-worker-run.md` (b) measured a hidden
+        // tab's worker keeping a timer at full rate in Chrome and both clocks at
+        // about nine ticks a second in Safari, so what stops a backgrounded run
+        // is this message and nothing the browser does.
+        post ({ kind: "prime", running: false });
+    }
 
     if (run === "start") {
         // The clock is re-primed rather than resumed. `requestAnimationFrame`
@@ -1603,14 +2724,16 @@ function setHalt (change) {
         // played. A game waking from rest is the same sentence with a different
         // clock: nothing was owed for the time it spent resting, because
         // nothing was going to happen in it.
-        last = 0;
-        accumulator = 0;
+        //
+        // The clock is the worker's, so this is a message, and `running` is what
+        // starts it asking the display for frames again.
+        post ({ kind: "prime", running: true });
 
-        // What is on the canvas is the last frame the loop painted, and the
-        // page has had no way to know what happened to it since - a fullscreen
-        // transition, a refit, a browser repainting a background tab. The flag
-        // says nothing about any of that, so the run starts with a frame nobody
-        // is claiming anything about.
+        // What is on the canvas is the last frame the worker painted, and
+        // nothing has had a way to know what happened to it since - a fullscreen
+        // transition, a refit, a browser repainting a background tab. The still
+        // claim says nothing about any of that, so the run starts with a frame
+        // nobody is claiming anything about.
         redraw ();
 
         runLoop ();
@@ -1633,13 +2756,6 @@ function wake () { setHalt ({ idle: false }); }
 // Everything the browser will now never finish telling us about. The pointer's
 // presence goes too, unlike `blur` below: a page behind something is not being
 // aimed at, where an unfocused window still has a mouse sitting over it.
-
-function shedInput () {
-    input.applyUpTo (Infinity);
-    input.releaseButtons ();
-    input.releasePointer ();
-    input.clearEdges ();
-}
 
 function togglePause () { setHalt ({ paused: ! halt.paused }); }
 
@@ -1691,7 +2807,30 @@ addEventListener ("visibilitychange",
 // The interval's handle is dropped deliberately. It is meant to outlive every
 // session this page builds, and a page that is going away takes it with it.
 
-watchStore (window, document, () => session);
+// What a run keeps, written out of what the simulation last sent.
+//
+// The store is `localStorage` and there is none on a worker's thread, so the
+// simulation cannot write one; the blob it renders crosses instead, on every
+// frame message that stepped, and `keptSave` above holds the newest.
+//
+// PUSHED RATHER THAN ASKED FOR IS THE POINT. `watchStore`'s three moments
+// include `pagehide` and a hidden tab, and the commonest way a game is left is a
+// closed tab, where there is no round trip left to take: a message asking the
+// worker for a blob would be posted into a page that is already gone. What is
+// held here needs no question asked, which is the same move `runRecord` makes
+// for a recording and for the harder version of the same reason.
+//
+// Between frames comes free on both sides: the blob is rendered inside the
+// worker's own frame callback, before the message that carries it, and a handler
+// or a timer callback on this page is a task of its own.
+
+function writeSave () {
+    if (! keptSave || ! saveStore || ! declaration) { return; }
+
+    saveStore.write (declaration.name, keptSave);
+}
+
+watchStore (window, document, () => ({ writeSave }));
 
 // A blur is not a keyup, and that is a third instance of the sentence the two
 // above are written around. Hold a key, switch applications, release it there:
@@ -1708,11 +2847,9 @@ watchStore (window, document, () => session);
 // move the mouse.
 
 addEventListener ("blur", () => {
-    if (! session) { return; }
+    if (! sim) { return; }
 
-    input.applyUpTo (Infinity);
-    input.releaseButtons ();
-    input.clearEdges ();
+    post ({ kind: "blur" });
 
     // Nothing was queued, so nothing told the page - and a button going up is
     // as much a change to what the game is handed as one going down. A game
@@ -1733,8 +2870,6 @@ const pauseButton = document.getElementById ("pause");
 pauseButton.addEventListener ("click", togglePause);
 
 document.getElementById ("hide").addEventListener ("click", toggleChrome);
-
-let accumulator = 0, last = 0, simTime = 0;
 
 // The animation frame the loop is waiting on, or null when it is waiting on
 // none.
@@ -1759,7 +2894,7 @@ let frameRequest = null;
 // the first bad frame.
 
 function runLoop () {
-    if (frameRequest !== null || halted (halt)) { return; }
+    if (! sim || frameRequest !== null || halted (halt)) { return; }
 
     frameRequest = requestAnimationFrame (loop);
 }
@@ -1777,94 +2912,55 @@ function loop (now) {
 
     // Unreachable, and here for what it prevents rather than for what it does:
     // `setHalt` cancels the pending request the instant anything halts, so a
-    // frame arriving anyway would be a game stepping while the player believes
-    // it is paused. The chain is left dead deliberately - whatever cleared the
+    // frame arriving anyway would be the page watching a simulation it has just
+    // told to stop. The chain is left dead deliberately - whatever cleared the
     // flag is what starts it again.
     if (halted (halt)) { return; }
 
-    if (! last) { last = now; simTime = now; return; }
+    // Whether anything has come back since the last time this asked. Here rather
+    // than on a timer of its own because this is the one callback that knows the
+    // page is awake: a watchdog on a timer would be reading a clock in a tab
+    // that stopped running animation frames, which is the reading
+    // `docs/runs/threaded-host-run.md` (b) says would fire every few seconds.
+    const stall = watchdog.overdue (now);
 
-    let delta = (now - last) / 1000;
-    last = now;
+    if (stall) { seize (stallLine (stall), stall.frame + 1); return; }
 
-    if (delta > 0.25) delta = 0.25;         // never spiral after a tab switch
-    accumulator += delta;
-
-    // `simTime` is the wall clock instant this step's boundary stands at. It
-    // advances in whole frames and is never reset to `now`, so it stays behind
-    // the wall clock by at most the accumulator's remainder.
-
-    // `held` is every step so far having reported `game_report_still`, which is
-    // what the screen path can be skipped on: the canvas holds the last frame
-    // painted, and a run of still frames is what connects it to the state now.
-    // One step in the burst that moved a pixel breaks the run, whatever the
-    // steps after it claim, because the frame finally drawn is the last state
-    // rather than the last claim.
-
-    let stepped = 0, held = true, rested = false;
-
-    while (accumulator >= 1 / FRAME_RATE && stepped < 8) {
-        input.applyUpTo (simTime);
-
-        const report = session.advance (input.buttons, input.edges,
-            input.pointer);
-
-        input.clearEdges ();
-
-        held = held && (report & REPORT.still) !== 0;
-
-        // Every step renders its own frame of samples, so this belongs inside
-        // the loop rather than after it: a catch-up of eight steps owes the
-        // audio thread eight frames of sound, and taking only the last would
-        // drop seven - the same mistake the input queue exists to avoid. A
-        // frame reported silent owes it a frame of silence, which is the one
-        // that costs no `render_audio` call and no buffer.
-        playAudio (report);
-
-        simTime += 1000 / FRAME_RATE;
-        accumulator -= 1 / FRAME_RATE;
-        stepped++;
-
-        // The rest of this catch-up would be steps that change nothing, so it
-        // is not run. `game_report_idle` is self propagating - `step` is a pure
-        // function of state, input and what the runner answers - and the input
-        // the remaining steps would advance their boundary onto is exactly what
-        // `waiting` below refuses to sleep through.
-        if (report & REPORT.idle) { rested = true; break; }
-    }
-
-    // The step cap was reached with work still owed, so this machine cannot
-    // keep up. Drop the backlog rather than carry it: left to accumulate,
-    // simulated time falls permanently behind the wall clock, and every queued
-    // key then has to wait out that lag before a step will take it. Dropping
-    // costs some skipped frames, which is what a machine this far behind was
-    // going to show anyway.
+    // And the other thread, on the same callback and by a different rule. A
+    // renderer that has stopped answering while the simulation goes on
+    // publishing is replaced the first time and is the run ending the second,
+    // which is `docs/archived/render-worker-plan.md`'s second question
+    // answered: a renderer that hangs twice is a game that hangs, and an
+    // unbounded loop would hide it.
     //
-    // Not when the break above was a game resting: the owed time is forgiven on
-    // the way back out of rest instead, and applying input up to now here would
-    // latch an edge into a queue that is about to have nothing draining it.
+    // AFTER the simulation's, because the two are not independent when both are
+    // overdue: a page whose simulation has stopped has nothing left to draw and
+    // no reason to build a renderer for it, and the line above has already
+    // ended the run by the time this one could run.
+    const blind = renderWatch.overdue (now);
 
-    if (! rested && accumulator >= 1 / FRAME_RATE) {
-        accumulator = 0;
-        simTime = now;
-        input.applyUpTo (simTime);
+    if (blind) {
+        if (renderWatch.replaced) {
+            seize (renderStallLine (blind), blind.frame);
+
+            return;
+        }
+
+        replaceRenderer ();
     }
 
-    if (stepped) { draw (held); }
-
-    // The game says nothing more is coming until something happens to it, and
-    // nothing has.
-    //
-    // Two things can already have happened by the time this is read, and both
-    // are the same shape: something arrived that the step which made the claim
-    // could not have seen. An input event queued behind that step's boundary is
-    // one - `waiting` is what asks. A task's answer, staged on its own message
-    // between animation frames rather than on this frame's work, is the other.
-    // Both are shown or drained by a step, so sleeping through either would
-    // strand it with nothing running.
-    if (rested && ! input.waiting () && ! session.stagedTasks ().length) {
-        setHalt ({ idle: true });
-    }
+    // IT POSTS NOTHING, and that is the whole of what this loop is left. The
+    // simulation asks the display for its own frames and publishes what each
+    // tick produced, and a third thread draws that into the canvas this page
+    // gave away - so there is no timestamp to send and no picture to collect.
+    // What arrives through `fromSim` is a heartbeat per display frame carrying
+    // the record, the save and the halt the game may have asked for, and what
+    // arrives through `fromRender` is a heartbeat per picture. This marks the
+    // instant each of them has been silent since, and the next message of
+    // either kind clears its own - which is the same arithmetic the round trip
+    // did, with the page's half of it gone.
+    watchdog.posted (now);
+    renderWatch.posted (now);
 }
 
 // ---------------------------------------------------------------------------
@@ -1888,7 +2984,8 @@ function loop (now) {
 
 function start ([bytes, host, rules]) {
     wasmBytes = bytes;
-    trampoline = host;
+    trampoline = host.module;
+    trampolineBytes = host.bytes;
     core = rules;
 
     // Before the first session and after the one round trip it needed: what a
@@ -1918,8 +3015,8 @@ function start ([bytes, host, rules]) {
     // the manifest: nothing is declared in advance any more, so at startup no
     // host knows what this game will ask for. What each read did is on the
     // console as it happens, and `resourceLine` is the whole log.
-    console.info (`player: ${session.name} reads what its bodies ask for from `
-        + resourceDirectory.href);
+    console.info (`player: ${declaration.name} reads what its bodies ask `
+        + `for from ` + resourceDirectory.href);
 
     // Built at load, not on the gesture. Compiling the module, loading the
     // worklet and constructing the processor all work on a suspended context -
@@ -1965,7 +3062,12 @@ function start ([bytes, host, rules]) {
 
     runLoop ();
 
-    present ();
+    // The frame `construct` left behind, drawn without waiting for a step. The
+    // simulation has held a state since it answered `opened` and its own frame
+    // callback may be a display frame away, so this is what puts the game's
+    // title screen up rather than an empty canvas - and it is a message, so a
+    // worker still compiling simply has not reached it yet.
+    redraw ();
 
     // A page opened into a background tab is already hidden, and
     // `visibilitychange` fires on a change rather than on the state - so
@@ -1982,7 +3084,7 @@ function start ([bytes, host, rules]) {
 //
 // Together rather than in sequence, because none of them waits on another and a
 // page holding two of the three can do nothing with what it has: a game imports
-// nothing, so without this player's own five functions there is no record to
+// nothing, so without this player's own six functions there is no record to
 // hand a `step`, and without the rulebook there is no table to spawn into, no
 // id to ask about and nothing to hold a run's arguments to.
 

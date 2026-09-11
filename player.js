@@ -6,18 +6,30 @@
 // `requestAnimationFrame` is in the page; nothing else is. What is left here is
 // the whole of what a host has to get right about a game - the struct offsets,
 // the two records it hands a game and the trampoline that makes them callable,
-// the answer protocol, the input queue and the palette - and it lives in a
-// file of its own so that it can be run without a browser at all.
+// the answer protocol, the input queue, the clock that decides how many steps
+// an interval owes and the palette - and it lives in a file of its own so that
+// it can be run without a browser at all.
 // `cmake/WebPlayerPlays.cmake` is what runs it that way, over the assembled
 // site, and its header says which of the page's claims survive the move and
 // which went with the browser.
 //
-// Loaded two ways, and it has to stay loadable both:
+// THERE ARE TWO SIDES OF THE GAME IN HERE NOW, and the line between them is a
+// thread rather than a browser. `Session` is the SIMULATION - it constructs,
+// steps, runs the tasks and records - and `Consumer` is what renders somewhere
+// else: a second instance of the same module, handed the state block and each
+// task block at their own addresses, on which the game's own `render_video`,
+// `render_audio` and `save` are called and `construct` and `step` never are.
+// `sim.worker.js` holds the first and the page holds the second, and both are
+// this file's because a consumer needs no browser either.
+//
+// Loaded three ways, and it has to stay loadable all three:
 //
 // - As a classic `<script src="player.js">` ahead of the page's own inline
 //   script, where every declaration below lands in the global lexical scope the
 //   inline script then reads. Not a module script: that is a second set of MIME
 //   rules to satisfy on somebody's static host, for nothing the page needs.
+// - Through `importScripts` in `task.worker.js` and `sim.worker.js`, which is
+//   the same classic-script rule one realm over.
 // - As CommonJS under node, through the four lines at the foot of this file.
 //   `module` is undefined in a browser, so the page never runs them.
 
@@ -60,9 +72,24 @@ const LAYOUT = {
     // field short reads 0, which is the legal declaration meaning *this game
     // persists nothing*, so a saving game would be constructed from null with
     // every other check green.
+    // THE CAPTURES moved four more in, at the tail again, and `bytes` went 64
+    // to 80. The two sizes fail exactly as `saveSize` does - a mirror one field
+    // short reads 0, which is the legal declaration meaning *the state block IS
+    // the description* - so a game that captures would be handed its own block
+    // and drawn from the wrong bytes. Every game in this tree declares 0 today
+    // and this page refuses anything else by name, which is what stops the two
+    // paths coexisting before there is a second one to coexist with.
+    //
+    // A BLEND SAT BETWEEN THE SAVE PAIR AND THE CAPTURES, at 64, and every
+    // offset behind it was four bytes further out while it did. It is gone, and
+    // the four that follow moved down with it - which is the one edit a tail
+    // rule cannot spare a hand-written mirror, and the reason every figure here
+    // was taken from the header's own assert rather than counted.
     game: { size: 0, name: 4, version: 8, palette: 20, construct: 24,
             step: 28, renderVideo: 32, renderAudio: 36, controls: 40,
-            background: 48, taskMax: 52, saveSize: 56, save: 60, bytes: 64 },
+            background: 48, taskMax: 52, saveSize: 56, save: 60,
+            videoStateSize: 64, audioStateSize: 68, captureVideo: 72,
+            captureAudio: 76, bytes: 80 },
 
     // Game_Task, which a game points at when it spawns. Read through the
     // pointer one call hands over rather than walked as an array, like
@@ -119,6 +146,23 @@ const LAYOUT = {
     // a body reads files and cannot spawn, which `interface/game.h` says with a
     // parameter list and this mirror says again with a shorter record.
     loader: { context: 0, load: 4, bytes: 8 },
+
+    // Game_Task_Reader, the record every RENDERER is handed - and the third
+    // block in this file this mirror writes rather than reads.
+    //
+    //     0 | const void * context
+    //     4 | const void * (* bytes) (const void *, uint32_t, uint32_t *)
+    //       | [sizeof=8, align=4]
+    //
+    // 8 against the native 16, for the reason the loader is 8 against 16. Two
+    // members and not five: a renderer names a task's bytes and can do nothing
+    // else, which `interface/game.h` says with a parameter list and this mirror
+    // says again with a shorter record.
+    //
+    // `stride` rather than `bytes` for the record's own size, for the reason
+    // `runner` above spells it that way: this record HAS a member called
+    // `bytes`, and one key cannot be both.
+    reader: { context: 0, bytes: 4, stride: 8 },
 
     // Game_Controls, whose members are offsets within it rather than within
     // Game - `game.controls` above says where it starts. Two `Game_Need`s, and
@@ -321,6 +365,29 @@ const RUNNER = 0x20000000;
 // context this session's `load` refuses rather than as one it serves.
 const LOADER = 0x10000000;
 
+// And the same for the reader a RENDERER is handed. Distinct from both, so that
+// a record kept out of one call and spent in another arrives as a context the
+// wrong service refuses rather than as one it serves. One value rather than a
+// ring: a renderer is never called inside another, so there is no second reader
+// to tell this one apart from and a flag is the whole of *is this call live*.
+const READER = 0x30000000;
+
+// And the record a host with no table of its own hands over, which is a null
+// one. It is the arrangement a `step` gets from a caller with no session behind
+// it, which every game's own tests hand a null runner
+// (`games/pong/tests/a_game_spends_exactly_the_block_it_asked_for.c:155`).
+//
+// A `Consumer` or a worklet processor built WITHOUT a trampoline is that host:
+// there is then no wasm function in its instance's table that a reader's
+// `bytes` could name, so the record it hands over is this. It renders anyway -
+// a description that names no task never asks - and what it cannot do is answer
+// one that does. Handing a trampoline to a consumer is what buys the answer,
+// and it costs one more module compiled in whatever scope the consumer lives
+// in: measured for an `AudioWorkletGlobalScope` in
+// `docs/runs/threaded-host-run.md` (c), where compiling the GAME's bytes
+// synchronously in that scope is already what every run does.
+const NO_READER = 0;
+
 // HOW MANY FRAMES' RUNNER RECORDS ARE KEPT DISTINCT is not written down here
 // any more. It is `host_core_context_ring`, read back through
 // `host_core_figure` - one number, in the rulebook both hosts answer out of,
@@ -504,12 +571,13 @@ const NEED_NAMES = ["none", "optional", "required"];
 // same pair would put a live game to sleep, in silence, on a screen the page
 // had stopped painting, with every check in this tree green.
 //
-// The three are read here and acted on entirely in the page, because every one
+// The four are read here and acted on entirely in the page, because every one
 // of them is about something only a browser has: `game_report_still` is a paint
 // and an upload not made, `game_report_silent` is a block the worklet is owed,
-// and `game_report_idle` is the 60 Hz wakeup and the audio thread behind it.
+// `game_report_idle` is the 60 Hz wakeup and the audio thread behind it, and
+// `game_report_save` is the blob a closing tab writes to `localStorage`.
 // Nothing about any of them can reach the game.
-const REPORT = { none: 0, still: 1, silent: 2, idle: 4 };
+const REPORT = { none: 0, still: 1, silent: 2, idle: 4, save: 8 };
 
 // The keyboard, as the console's six buttons see it. Here rather than in the
 // page because it is a table rather than an event handler: what arrives is a
@@ -670,20 +738,30 @@ async function fetchTrampoline (base) {
             + `${response.status} ${response.statusText}.`);
     }
 
-    return new WebAssembly.Module (await response.arrayBuffer ());
+    // THE BYTES BESIDE THE MODULE, because one consumer cannot be handed the
+    // module: a `WebAssembly.Module` will not deserialize into an
+    // `AudioWorkletGlobalScope` - posted to a port it arrives at
+    // `onmessageerror`, measured in `docs/runs/threaded-host-run.md` (c) -
+    // where the bytes cross and `new WebAssembly.Module` compiles synchronously
+    // off the main thread. The processor needs its own copy of this module
+    // because a description names a task by id and answering one is a wasm
+    // function in that instance's table.
+    const bytes = await response.arrayBuffer ();
+
+    return { module: new WebAssembly.Module (bytes), bytes };
 }
 
-// This host's three functions, in one instance's table, at three indices it
-// answers with.
+// This host's own functions, in one instance's table, at the indices it answers
+// with.
 //
-// `host` is `{ spawn, done, bytes, release, load }`, the closures that decide
-// everything; the module below only carries the call across the boundary. One
-// instantiation per game instance and per body instance, because an import is
-// bound at instantiate and the closures differ.
+// `host` is `{ spawn, done, bytes, release, load, read }`, the closures that
+// decide everything; the module below only carries the call across the
+// boundary. One instantiation per game instance and per body instance, because
+// an import is bound at instantiate and the closures differ.
 //
-// The five land at the same indices in every instance of one module, and that
+// The six land at the same indices in every instance of one module, and that
 // is load bearing rather than incidental: a table's initial length is the
-// module's, so growing by five from the same length gives the same five indices
+// module's, so growing by six from the same length gives the same six indices
 // in the game's instance and in a body's. It is what makes a loader record
 // carried out of a body and called through by a `step` land on THIS host's
 // `load` - a refusal naming the rule - rather than on whatever index the game's
@@ -698,12 +776,13 @@ function installTrampoline (trampoline, instance, host) {
     // to, and a table that cannot grow is a module no host can hand a record.
     // `cmake/WasmCompiler.cmake` passes `--growable-table` for exactly this,
     // so a refusal here names the flag rather than the throw.
-    try { at = table.grow (5); }
+    try { at = table.grow (6); }
     catch (error) {
         refuse (`this module's function table will not grow, so this host has `
-            + `nowhere to put the five functions a \`Game_Task_Runner\` and a `
-            + `\`Game_Resource_Loader\` are made of. A module is linked with `
-            + `--growable-table for that reason; this one was not.`);
+            + `nowhere to put the six functions a \`Game_Task_Runner\`, a `
+            + `\`Game_Resource_Loader\` and a \`Game_Task_Reader\` are made `
+            + `of. A module is linked with --growable-table for that reason; `
+            + `this one was not.`);
     }
 
     const shim = new WebAssembly.Instance (trampoline, { host });
@@ -713,9 +792,10 @@ function installTrampoline (trampoline, instance, host) {
     table.set (at + 2, shim.exports.bytes);
     table.set (at + 3, shim.exports.release);
     table.set (at + 4, shim.exports.load);
+    table.set (at + 5, shim.exports.read);
 
     return { spawn: at, done: at + 1, bytes: at + 2, release: at + 3,
-             load: at + 4 };
+             load: at + 4, read: at + 5 };
 }
 
 // ---------------------------------------------------------------------------
@@ -963,9 +1043,9 @@ class HostCore {
     // index into the CORE's own table - and a JavaScript closure is not a wasm
     // function, exactly as it is not one in a game's table.
     // `products/trampoline` is the answer to that problem for a game and cannot
-    // be the answer here: its three wrappers carry the three signatures
-    // `Game_Task_Runner` and `Game_Resource_Loader` declare, and `reclaim`'s is
-    // none of them. The core guards for a record it was not given, so it drops
+    // be the answer here: its six wrappers carry the six signatures
+    // `Game_Task_Runner`, `Game_Resource_Loader` and `Game_Task_Reader`
+    // declare, and `reclaim`'s is none of them. The core guards for a record it was not given, so it drops
     // the block and says nothing, and `Session.reclaimBlocks` reconciles
     // afterwards: every address this host's arena holds that no row of the
     // table names any more goes back on the spare list. That decides nothing -
@@ -1654,14 +1734,14 @@ function runTaskBody (module, trampoline, core, task, input, read) {
     // The module imports nothing, so it instantiates against nothing - and
     // everything this host owes a body goes in through the table instead.
     //
-    // All five wrappers are installed rather than only `load`, and that is a
-    // deliberate mirror rather than tidiness: the five land at fixed indices
-    // in every instance of one module, so installing the same five here keeps
+    // All six wrappers are installed rather than only `load`, and that is a
+    // deliberate mirror rather than tidiness: the six land at fixed indices
+    // in every instance of one module, so installing the same six here keeps
     // the game's instance and this one agreeing about what each index means. A
-    // body may read and may not spawn or poll - `interface/game.h` says so with
-    // a parameter list, and the four inert answers say it again, because a
-    // table slot that existed in one instance and not the other would be the
-    // two disagreeing about a number a record carries.
+    // body may read and may not spawn, poll or draw - `interface/game.h` says
+    // so with a parameter list, and the five inert answers say it again,
+    // because a table slot that existed in one instance and not the other would
+    // be the two disagreeing about a number a record carries.
     let slots;
 
     try {
@@ -1673,6 +1753,7 @@ function runTaskBody (module, trampoline, core, task, input, read) {
             done: () => 0,
             bytes: () => 0,
             release: () => {},
+            read: () => 0,
         });
     }
     catch (error) {
@@ -2304,17 +2385,25 @@ class Session {
         // for: a game module's import section is empty, so there is no object
         // to build and no name for this host to answer for. What it owes a game
         // arrives the other way, as records this file composes in the module's
-        // own linear memory - and the three functions those records point at go
+        // own linear memory - and the six functions those records point at go
         // into the module's table on the next line.
         this.instance = new WebAssembly.Instance (this.module, {});
         const ex = this.instance.exports;
         this.ex = ex;
         this.memory = ex.memory;
         this.table = ex.__indirect_function_table;
-        this.heap = ex.__heap_base.value ?? ex.__heap_base;
+
+        // Where this module's arena begins, kept beside the bump pointer that
+        // is about to leave it behind. It is a CONSTANT OF THE MODULE - the
+        // same number in every instance of it, measured on all twelve games in
+        // `docs/runs/threaded-host-run.md` (a) - which is what makes a consumer
+        // able to lay its own memory out at this session's addresses without
+        // being told what this arena did.
+        this.heapBase = ex.__heap_base.value ?? ex.__heap_base;
+        this.heap = this.heapBase;
         this.seed = seed;
 
-        // Where this session's three functions landed in that table, which is
+        // Where this session's six functions landed in that table, which is
         // what the records carry in place of addresses.
         this.slots = installTrampoline (trampoline, this.instance,
             this.services ());
@@ -2358,6 +2447,30 @@ class Session {
         this.runnerRing = this.alloc (
             (this.constructSlot + 1) * LAYOUT.runner.stride);
 
+        // And the renderer's record, one rather than a ring. A renderer is
+        // never called inside another - `interface/game.h` says so of all three
+        // - so there is no second call to tell this one apart from, and one
+        // address is the whole of what a consumer has to be told.
+        //
+        // WHAT IS COMPOSED HERE IS NEVER HANDED TO ANYTHING. This session runs
+        // no renderer: the picture is rendered in the render worker's instance
+        // and the sound in the worklet's, and each writes its OWN record at this
+        // address in its own memory, over its own table's index. So what this
+        // allocation really publishes is the address - `layout` below carries it
+        // - and what these two words are for is the refusal: a call reaching
+        // this record is a game that kept the address and spent it from a
+        // `step`, and `read` below answers every one of them the same way.
+        this.readerPtr = this.alloc (LAYOUT.reader.stride);
+
+        {
+            const compose = this.view ();
+
+            compose.setUint32 (this.readerPtr + LAYOUT.reader.context, READER,
+                true);
+            compose.setUint32 (this.readerPtr + LAYOUT.reader.bytes,
+                this.slots.read, true);
+        }
+
         // One game per module: the factory is a direct export, so there is no
         // enumeration and no table lookup to reach it.
         //
@@ -2388,6 +2501,13 @@ class Session {
 
         const gamePtr = this.alloc (LAYOUT.game.bytes + guardBytes);
 
+        // Kept, because a consumer of this session's states calls `factory` in
+        // its own instance and has to write the struct SOMEWHERE: at this
+        // address it lands on bytes that are host memory in both instances and
+        // that its own `factory` fills with the same values, so no region a
+        // state can reference is disturbed by it.
+        this.gamePtr = gamePtr;
+
         new Uint8Array (this.memory.buffer, gamePtr,
             LAYOUT.game.bytes + guardBytes).fill (poison);
 
@@ -2414,7 +2534,12 @@ class Session {
         this.stateSize = view.getUint32 (gamePtr + g.size, true);
         this.namePtr   = view.getUint32 (gamePtr + g.name, true);
         this.version   = [0, 4, 8].map (o => view.getUint32 (gamePtr + g.version + o, true));
-        this.palettePtr = view.getUint32 (gamePtr + g.palette, true);
+
+        // AND NOT THE PALETTE, which is the one identity field a session has no
+        // reader for. Colours are read off a `Consumer` - the page's bare
+        // `declaration` for the chrome, the render worker's instance for the
+        // pixels - because both of those draw and this one does not.
+
         // Read through the table, then held to the ARITY the header declares -
         // which is the second of the three deployed skews, and the one that had
         // been priced as unfixable.
@@ -2475,10 +2600,28 @@ class Session {
         // has something to see.
         this.construct = held (g.construct, 6, "construct");
         this.step = held (g.step, 3, "step");
-        this.renderVideo = held (g.renderVideo, 2, "render_video");
+
+        // NEVER CALLED HERE, and kept for exactly what the sound's twin below
+        // is kept for. The picture is rendered in the render worker's own
+        // instance of this module, on that instance's own table index, so
+        // nothing on this side ever spends this pointer - what it is read for is
+        // the presence check and the arity check, which refuse a module that
+        // describes no picture, and a deployed module whose `render_video` takes
+        // the wrong number of parameters, before a frame is stepped rather than
+        // on a thread that can say nothing about it.
+        this.renderVideoFn = held (g.renderVideo, 3, "render_video");
 
         // Optional: a silent game declares none.
-        this.renderAudio = held (g.renderAudio, 2, "render_audio");
+        //
+        // NEVER CALLED HERE, and kept anyway. The sound is rendered in the
+        // worklet's own instance of this module, on that instance's own table
+        // index, so nothing on this side ever spends this pointer - what it is
+        // read for is the arity check, which refuses a deployed module whose
+        // `render_audio` takes the wrong number of parameters before a frame is
+        // stepped rather than trapping on the audio thread where a page can say
+        // nothing about it, and the two questions below: whether the module's
+        // sound triple is whole, and whether a tick has any sound to post.
+        this.renderAudioFn = held (g.renderAudio, 3, "render_audio");
 
         // What the game says it reads of `Game_Input`. A declaration about the
         // module rather than about a frame, so it is read once here rather than
@@ -2554,6 +2697,58 @@ class Session {
                 + `save_size is ${this.saveSize} and \`save\` is `
                 + `${this.saveFn ? "set" : "null"}, and the two are declared `
                 + `together or not at all.`);
+        }
+
+        // What each renderer is handed, read here beside `saveSize` because it
+        // is the same kind of thing: a declaration about the module, read once
+        // at load.
+        this.videoStateSize = view.getUint32 (gamePtr + g.videoStateSize, true);
+        this.audioStateSize = view.getUint32 (gamePtr + g.audioStateSize, true);
+
+        // And the two renderers that fill those bytes, held to their arity like
+        // every other call across this boundary. The capture is the
+        // SIMULATION's and is taken after a step, so this session is where they
+        // are called and a consumer never calls either.
+        this.captureVideoFn = held (g.captureVideo, 2, "capture_video_state");
+        this.captureAudioFn = held (g.captureAudio, 2, "capture_audio_state");
+
+        // The picture's pair refused half-declared, in the words `console.c`
+        // and `goldenhash.js` refuse it in, and for the reason the save pair
+        // is: bytes nothing renders, or a renderer whose length is zero.
+        if ((this.videoStateSize !== 0) !== (this.captureVideoFn !== null)) {
+            refuse (`this module's factory left the Game struct incomplete: `
+                + `video_state_size is ${this.videoStateSize} and `
+                + `\`capture_video_state\` is `
+                + `${this.captureVideoFn ? "set" : "null"}, and the two are `
+                + `declared together or not at all.`);
+        }
+
+        // The SOUND is a triple where the picture is a pair, because
+        // `render_audio` is optional and the description it would have read is
+        // optional exactly where it is. All three or none, named together for
+        // the console's reason: which of them a reader has to go and write is
+        // not decidable from here.
+        if ((this.renderAudioFn !== null) !== (this.audioStateSize !== 0)
+            || (this.audioStateSize !== 0) !== (this.captureAudioFn !== null))
+        {
+            refuse (`this module's factory left the Game struct incomplete: `
+                + `\`render_audio\` is `
+                + `${this.renderAudioFn ? "set" : "null"}, audio_state_size is `
+                + `${this.audioStateSize} and \`capture_audio_state\` is `
+                + `${this.captureAudioFn ? "set" : "null"}, and the three are `
+                + `declared together or not at all.`);
+        }
+
+        // And the picture's zero, which is a WHOLE declaration and refused all
+        // the same: it said *the state block is the description*, and a host
+        // reading it carried a second path through every renderer for a
+        // spelling nothing says any more. Unconditional where the sound's zero
+        // is legal, because `render_video` is required and there is no game
+        // with no picture to describe.
+        if (! this.videoStateSize) {
+            refuse ("this module declares no picture description: "
+                + "video_state_size is 0, and a game declares what its "
+                + "renderers read.");
         }
 
         // And the session of rules that declaration sizes, laid out in the
@@ -2663,8 +2858,27 @@ class Session {
         }
 
         this.inputPtr = this.alloc (LAYOUT.inputBytes);
+
+        // The framebuffer and the audio block, and this session writes NEITHER:
+        // `render_video` runs in the render worker's own instance and
+        // `render_audio` in the worklet's. Both are allocated HERE all the same,
+        // and that is the point rather than a leftover - a consumer lays no
+        // arena down, so what makes its scratch land somewhere that overlaps no
+        // state block and no task block is that this arena chose the address and
+        // published it. Two 57,600- and 1,600-byte holes in the simulation's
+        // memory buy every consumer a place to render into, and this session
+        // never spends either.
         this.videoPtr = this.alloc (FRAME_WIDTH * FRAME_HEIGHT);
         this.samplesPtr = this.alloc (SAMPLES_PER_FRAME * 2);
+
+        // The two descriptions, taken after every step and handed to the
+        // renderers in place of the state block. The picture for every module
+        // that reaches here, because one describing none was refused above; the
+        // sound for every module that has one to render.
+        this.videoStatePtr = this.alloc (this.videoStateSize);
+
+        this.audioStatePtr = this.audioStateSize
+            ? this.alloc (this.audioStateSize) : NOTHING;
 
         // The `task` and `taskfail` half of a mark, written on the frame an
         // answer becomes visible and by id, because that is the whole of what
@@ -2699,6 +2913,10 @@ class Session {
             this.argCount, this.armConstruct ());
 
         this.retireConstruct ();
+
+        // Before any frame, so that a host drawing before its first step is
+        // handed a description rather than the zeros a fresh hole begins with.
+        this.capture ();
 
         // The replay log records only changes: input is piecewise constant, so
         // an entry means "these buttons from this frame until the next entry".
@@ -2740,8 +2958,10 @@ class Session {
 
     get name () { return this.string (this.namePtr); }
 
-    get palette () { return new Uint8Array (this.memory.buffer, this.palettePtr, PALETTE_SIZE * 3); }
-    get frame ()   { return new Uint8Array (this.memory.buffer, this.videoPtr, FRAME_WIDTH * FRAME_HEIGHT); }
+    // AND NO `palette` AND NO `frame`. Both were views a caller painted out of
+    // and there is no caller: `paint` is spent on a `Consumer`'s framebuffer and
+    // a `Consumer`'s palette, one thread out, in the instance that rendered
+    // them.
 
     // ----------------------------------------------------------------------
     // Arguments: the pairs this run was told, laid down as the flat array
@@ -2769,6 +2989,13 @@ class Session {
     // as nothing else - so a game written before a run could be told anything
     // is handed exactly what it was handed then.
     buildArguments () {
+        // Where the pairs and their strings ended up, as one span, or null for
+        // a run that supplied none. A consumer mirrors it once at session
+        // start, because `interface/game.h:34-44` makes the argument storage
+        // one of the six kinds of memory a state may point into and the header
+        // gives it the whole run.
+        this.argsRegion = null;
+
         if (! this.supplied.length) { return NOTHING; }
 
         // Strings first, at byte alignment, because a string is bytes and the
@@ -2803,6 +3030,14 @@ class Session {
             view.setUint32 (pair + PAIR.name, entry.namePtr, true);
             view.setUint32 (pair + PAIR.value, entry.valuePtr, true);
         });
+
+        // One span rather than one per string, because the whole lot was laid
+        // down by consecutive `alloc` calls with nothing else between them: the
+        // first name's bytes to the end of the array is exactly what this
+        // method wrote and nothing more.
+        this.argsRegion = { address: this.supplied [0].namePtr,
+            span: arrayPtr + this.supplied.length * PAIR.bytes
+                - this.supplied [0].namePtr };
 
         return arrayPtr;
     }
@@ -2852,6 +3087,12 @@ class Session {
     // why that comes free on this host - and as many times as a caller likes,
     // because the header makes the schedule unobservable to the run. Null for a
     // game that persists nothing.
+    //
+    // THE ONLY `save` IN THIS FILE, and the reason a `Consumer` has none: this
+    // is the instance that steps, so this is the block where every pointer the
+    // game kept resolves. What decides WHEN it is called is `game_report_save`,
+    // which the worker reads off a tick and this method knows nothing about -
+    // the schedule is the host's and a request only prices it.
     renderSave () {
         if (! this.saveSize || ! this.saveFn) { return null; }
 
@@ -2986,21 +3227,22 @@ class Session {
         });
     }
 
-    // The three functions this session's records point at, as the closures the
-    // trampoline forwards to - and only two of them are a service. `load` is
+    // The six functions this session's records point at, as the closures the
+    // trampoline forwards to - and `load` is not one of the services. It is
     // answered here to REFUSE, because a parameter list names what its callee
     // can do: a body reads files and cannot spawn, a `step` spawns and releases
-    // and cannot read a file, and the copy that serves a read is the one
-    // `runTaskBody` binds against the instance the body runs in.
+    // and cannot read a file, a renderer names a task's bytes and can do
+    // nothing else, and the copy that serves a read is the one `runTaskBody`
+    // binds against the instance the body runs in.
     //
-    // All three are installed whether the game spends any of them or not, and
-    // the reason is no longer about import sections: the three wrappers land at
+    // All six are installed whether the game spends any of them or not, and
+    // the reason is no longer about import sections: the six wrappers land at
     // fixed table indices in every instance of one module, so a session that
-    // installed two and a body's instance that installed three would disagree
+    // installed five and a body's instance that installed six would disagree
     // about what a number in a record means. The console's `hermit` fixture
-    // calls neither member of the runner it is handed and gets the table's
-    // three slots exactly as `borrower` does, which is what "permission is not
-    // provision" became when the imports went.
+    // calls no member of the runner it is handed and gets the table's slots
+    // exactly as `borrower` does, which is what "permission is not provision"
+    // became when the imports went.
     services () {
         // Whether the runner's context is this frame's. A game passes back what
         // the record it was handed carries, so a wrong one is a game that
@@ -3250,6 +3492,44 @@ class Session {
                 // dereferenced it, and this is where it goes back to being a
                 // pointer the game reads.
                 return this.core.bytes (this.host, id);
+            },
+
+            // The reader's `bytes`, which is the whole of what a RENDERER may
+            // ask this host for. The same sample `bytes` above answers, with
+            // the length written beside it: a renderer holds no descriptor, so
+            // `output_size` travels with the block rather than being
+            // remembered.
+            //
+            // `size` is written before anything else, so every path out of here
+            // leaves a caller a length it can read without first branching on
+            // the pointer. A null `size` is a game passing something that is
+            // not the out-parameter the header declares, and is left alone
+            // rather than written through.
+            read: (context, id, size) => {
+                const put = (span) => {
+                    if (! size) { return; }
+
+                    this.view ().setUint32 (size, span >>> 0, true);
+                };
+
+                put (0);
+
+                // A null context is not a stale one and is not reported, for
+                // the reason a null runner's is not: there is no session behind
+                // one to write a fault into.
+                if (! context) { return 0; }
+
+                // ALWAYS, because this session runs no renderer: the picture
+                // is drawn in the render worker's instance and the sound in the
+                // worklet's, and each answers its own reader out of the blocks
+                // it was handed. So a call that reaches here is a game that kept
+                // the address and spent it from a `step`, which is the one thing
+                // this record can still be used for and is refused rather than
+                // served.
+                refuse (`${this.name} named a task's bytes through a `
+                    + `reader from outside the renderer it was handed to. A `
+                    + `reader is valid for one call and no longer, and the `
+                    + `instance that steps is handed none at all.`);
             },
 
             release: (context, id) => {
@@ -3687,21 +3967,606 @@ class Session {
 
         this.retireRunner ();
 
+        this.capture ();
+
         this.countFrame ();
 
         return report;
     }
 
-    // Rendered into the game's own memory, then copied out: the buffer is
-    // reused every frame, and the worklet needs one it can keep.
-    renderSamples () {
-        if (! this.renderAudio) return new Int16Array (SAMPLES_PER_FRAME);
+    // The two descriptions, taken on the LIVE block at the one moment every
+    // pointer in it resolves: after `construct` returns and after every `step`
+    // returns, never inside a call and never inside a renderer. What this
+    // writes is what crosses to wherever the picture is drawn and wherever the
+    // sound is rendered.
+    capture () {
+        this.captureVideoFn (this.statePtr, this.videoStatePtr);
 
-        this.renderAudio (this.statePtr, this.samplesPtr);
+        if (this.captureAudioFn) {
+            this.captureAudioFn (this.statePtr, this.audioStatePtr);
+        }
+    }
+
+    // Whether this module has a sound to render at all, which is what decides
+    // whether a tick owes the speaker bytes or silence. A read of the RENDERER
+    // rather than of a declared size: the two agree by the refusal at load, and
+    // this is the one of them that says what the far side would do with them.
+    get sounds () { return this.renderAudioFn !== null; }
+
+    // AND NO DRAWING PATH HERE, which is
+    // `docs/archived/render-worker-plan.md`'s third question answered: the
+    // instance that steps never renders a picture.
+    //
+    // This class used to hold one beside `Consumer.renderVideo` and it was
+    // deliberately not the same code - a consumer renders out of a layout it was
+    // HANDED where a session owns the arena and reaches its own pointers. There
+    // is one of them left, and it is the consumer's, because one path is what
+    // lets this tree say what a frame is and a fallback nothing exercises is a
+    // fallback that rots. What the session still owes a renderer is `layout`
+    // below and the two description holes it publishes there.
+
+    // ----------------------------------------------------------------------
+    // What this session PUBLISHES, for a `Consumer` that renders somewhere
+    // else.
+    //
+    // Three things and no more: the addresses a consumer has to know, the
+    // bytes at an address, and the blocks a delivery has put there. Nothing
+    // here decides where a consumer is or how the bytes reach it - the worker
+    // posts them across a thread and `goldenhash.js --mirror` writes them
+    // straight into a second instance in the same process, and both spend
+    // exactly these three.
+    // ----------------------------------------------------------------------
+
+    // Every address a consumer has to be told, because it lays no arena of its
+    // own down. `heapBase` is the assertion rather than an instruction: a
+    // consumer built from another module would agree about nothing else here.
+    //
+    // THE STATE BLOCK IS NOT AMONG THEM AND NEITHER IS THE SAVE BLOB. A
+    // consumer renders a picture or a sound out of a description, and `save` is
+    // rendered by the instance that steps and by nothing else - so an address
+    // for either would be a hole published for a reader that does not exist.
+    // `stateSize` stays, as the figure rather than the region: two instances of
+    // one module declare one state size, so it is what refuses a consumer built
+    // from another build below.
+    layout () {
+        return {
+            heapBase: this.heapBase,
+            game: this.gamePtr,
+            stateSize: this.stateSize,
+            video: this.videoPtr,
+            samples: this.samplesPtr,
+
+            // And where the two descriptions land, which is what a consumer
+            // renders out of: a hole this arena chose and published, not one of
+            // its own.
+            videoState: this.videoStatePtr,
+            videoStateSize: this.videoStateSize,
+            audioState: this.audioStatePtr,
+            audioStateSize: this.audioStateSize,
+
+            // And the eight bytes a reader record occupies. A consumer composes
+            // its OWN record there, over its own table's index for `read` -
+            // this is the address rather than the record, exactly as `game`
+            // above is the address of a descriptor each instance writes for
+            // itself.
+            reader: this.readerPtr,
+        };
+    }
+
+    // A copy of a span of this memory, with a buffer of its own so that a host
+    // may transfer it to another thread rather than copy it a second time.
+    bytesAt (at, span) {
+        return new Uint8Array (this.memory.buffer, at, span).slice ();
+    }
+
+    // The two descriptions, which are what a consumer is handed every tick.
+    // Null for the sound of a silent game, which has none and is posted none.
+    videoStateBytes () {
+        return this.bytesAt (this.videoStatePtr, this.videoStateSize);
+    }
+
+    audioStateBytes () {
+        return this.audioStateSize
+            ? this.bytesAt (this.audioStatePtr, this.audioStateSize) : null;
+    }
+
+    // The regions laid down once and never written again: the argument storage
+    // and the save blob `construct` was handed. Both are the host's for the
+    // whole run by `interface/game.h:34-44`, so a game may hold a pointer into
+    // either and a consumer needs both before the first state can be rendered.
+    residentRegions () {
+        const regions = [];
+
+        if (this.argsRegion) {
+            regions.push ({ address: this.argsRegion.address,
+                bytes: this.bytesAt (this.argsRegion.address,
+                    this.argsRegion.span) });
+        }
+
+        if (this.saveSize) {
+            regions.push ({ address: this.savedPtr,
+                bytes: this.bytesAt (this.savedPtr, this.saveSize) });
+        }
+
+        return regions;
+    }
+}
+
+// The task blocks a consumer has not been handed, and the record of what it
+// has, brought up to date.
+//
+// BY ID RATHER THAN BY ADDRESS, and that is the whole of the care this needs.
+// The arena recycles a block the moment the frame boundary settles its release
+// (`reclaimBlocks` above), so one address carries one task's answer and then
+// another's; a record kept by address would take the second for the first and
+// leave a consumer rendering bytes that are two tasks old. An id is minted once
+// per run and names one block for its whole life, so an address arriving under
+// a new id is a delivery and an address arriving under the same one is not.
+//
+// `held` is the caller's own Map from id to address, mutated here: one consumer
+// holds one of them, which is what makes release per consumer and local -
+// nothing here asks what any other consumer has, and the session waits on none
+// of them.
+function freshDeliveries (session, held) {
+    const fresh = [];
+    const live = new Set ();
+
+    for (const row of session.rows ()) {
+        if (! row.block) { continue; }
+
+        live.add (row.id);
+
+        if (held.get (row.id) === row.block) { continue; }
+
+        const span = session.blocks.get (row.block);
+
+        // A row naming a block this arena is not holding is not a delivery this
+        // host can serve, and there is no such row: `blocks` is written where
+        // the bytes are taken and cleared where the table stops naming them.
+        // Skipped rather than refused, because a consumer rendering last
+        // frame's picture is recoverable and a refused page is not.
+        if (! span) { continue; }
+
+        held.set (row.id, row.block);
+
+        // THE ID TRAVELS WITH THE BYTES, which is what a description needs and
+        // an address is not: a capture names a task by id, and the consumer
+        // resolving one has no table to look it up in. Nothing else about the
+        // record changed - a caller that only writes the bytes at their address
+        // reads the same two fields it always did.
+        fresh.push ({ id: row.id, address: row.block, span,
+            bytes: session.bytesAt (row.block, span) });
+    }
+
+    for (const id of [...held.keys ()]) {
+        if (live.has (id)) { continue; }
+
+        held.delete (id);
+    }
+
+    return fresh;
+}
+
+// ---------------------------------------------------------------------------
+// Consumer: a second instance of the game's own module, handed bytes and asked
+// to render them.
+//
+// PUBLISH BY MIRRORING, NOT BY SHARING. A state block holds absolute addresses
+// - into its own tail, into a task block, into the argument storage and into
+// the save blob, which is `interface/game.h:34-44`'s list - so a copy of it is
+// complete only where every one of those addresses still means what it meant.
+// A copy at another address in the same memory does not: eleven of the twelve
+// games in this tree keep pointers in their state, measured in
+// `docs/archived/threaded-host-plan.md`, and a copy beside the live block
+// points back at the live block. A copy at the SAME address in ANOTHER memory
+// resolves every one of them, and that is all this class is.
+//
+// It never calls `construct` and never calls `step`. What it holds is bytes it
+// was given plus whatever the module's own data segments put there, and what it
+// runs on them is the game's own `render_video`, `render_audio` and `save` -
+// so a game cannot tell that a renderer ran here rather than in the instance
+// that stepped, and could only tell by reading a mutable byte outside the state
+// block, which `cmake/CheckStatics.cmake` already refuses.
+//
+// IT TAKES NO IMPORTS AND HOLDS NO HOST, and it installs a trampoline only
+// where a description can name a task. A renderer calls no host function of its
+// own accord - the runner and the loader are `step`'s and a body's - but a
+// capture carries an ID where a state block carried a pointer, so a renderer
+// handed a description has one question left and `Game_Task_Reader` is it.
+// Measured in `docs/runs/threaded-host-run.md` (a) over all forty-four
+// recordings and (c) inside an `AudioWorkletGlobalScope`; what has changed
+// since is the one wasm function this instance now needs in its own table, and
+// a `Consumer` built without a trampoline still renders - it answers every id
+// with nothing, which is what a game that names none never notices.
+//
+// IT LAYS NO ARENA DOWN. Every address it uses arrives in the `layout` its
+// session published, so there is no second copy of the prologue here that could
+// drift from the one in `Session` above. What it does for itself is grow its
+// memory to cover an address it is handed, which is the one thing a bump
+// allocator's absence still leaves it owing.
+// ---------------------------------------------------------------------------
+
+class Consumer {
+    // `module` is the game's own compiled module - the same one the simulation
+    // instantiated, or another compilation of the same bytes.
+    //
+    // `layout` is what `Session.layout` answered, or NULL for an instance built
+    // only to read the module's declaration. A host has one question it must
+    // answer before a session exists and cannot answer without a module - what
+    // this game is called and how many bytes it persists, which is what a save
+    // store is keyed and sized by - and a bare instance is the honest way to
+    // ask it: `factory` writes host memory, this instance is discarded, and no
+    // second reader of `LAYOUT` is invented for it. Such a consumer renders
+    // nothing, because it has nowhere to render from or to.
+    constructor (module, layout, trampoline) {
+        this.instance = new WebAssembly.Instance (module, {});
+
+        const ex = this.instance.exports;
+
+        this.ex = ex;
+        this.memory = ex.memory;
+        this.table = ex.__indirect_function_table;
+        this.layout = layout;
+
+        const heapBase = ex.__heap_base.value ?? ex.__heap_base;
+
+        this.heapBase = heapBase;
+
+        // The one assumption this whole design rests on, asserted rather than
+        // assumed on every session: the module lays its own data out
+        // identically in every instance, so everything the host put above
+        // `__heap_base` can be put at the same address again. A consumer built
+        // from a different module is the failure this catches, and it would
+        // otherwise show as a picture that is wrong rather than as a page that
+        // says why.
+        if (layout && heapBase !== layout.heapBase) {
+            refuse (`this consumer's module begins its heap at ${heapBase} `
+                + `and the simulation's begins at ${layout.heapBase}, so the `
+                + `two are not the same module and no address the simulation `
+                + `publishes means anything here.`);
+        }
+
+        // The descriptor, read off THIS instance rather than taken from the
+        // simulation's, because the function pointers on it are indices into
+        // this instance's own table. `factory` writes host memory at an address
+        // the simulation also spent on host memory, so nothing a state can
+        // reference is touched; a declaration-only instance puts it at the foot
+        // of its own arena, where this instance will never put anything else.
+        const gamePtr = layout ? layout.game : heapBase;
+
+        this.room (gamePtr, LAYOUT.game.bytes);
+
+        new Uint8Array (this.memory.buffer, gamePtr, LAYOUT.game.bytes)
+            .fill (0);
+
+        ex.factory (gamePtr);
+
+        const view = new DataView (this.memory.buffer);
+        const g = LAYOUT.game;
+
+        const held = (offset) => {
+            const pointer = view.getUint32 (gamePtr + offset, true);
+
+            return pointer ? this.table.get (pointer) : null;
+        };
+
+        this.stateSize = view.getUint32 (gamePtr + g.size, true);
+        this.namePtr = view.getUint32 (gamePtr + g.name, true);
+        this.version = [0, 4, 8].map (
+            o => view.getUint32 (gamePtr + g.version + o, true));
+        this.palettePtr = view.getUint32 (gamePtr + g.palette, true);
+
+        // The renderers and nothing else: `save` is not among them, because it
+        // is rendered by the instance that steps and this one is never handed a
+        // state block to render it from.
+        this.renderVideoFn = held (g.renderVideo);
+        this.renderAudioFn = held (g.renderAudio);
+
+        this.controls = {
+            buttons: view.getInt32 (
+                gamePtr + g.controls + LAYOUT.controls.buttons, true),
+            pointer: view.getInt32 (
+                gamePtr + g.controls + LAYOUT.controls.pointer, true),
+        };
+
+        this.background =
+            view.getUint8 (gamePtr + g.background) & (PALETTE_SIZE - 1);
+
+        this.taskMax = view.getUint32 (gamePtr + g.taskMax, true);
+        this.saveSize = view.getUint32 (gamePtr + g.saveSize, true);
+
+        // What each renderer expects to be handed, read for the reason
+        // `saveSize` is: a declaration about the module, and the same in every
+        // instance of it. The picture's is never zero, which the SIMULATION's
+        // own load refused before this instance was built, and the sound's is
+        // zero exactly for a silent game - this one reads the figures to size
+        // the holes it is told to mirror into.
+        this.videoStateSize = view.getUint32 (gamePtr + g.videoStateSize, true);
+        this.audioStateSize = view.getUint32 (gamePtr + g.audioStateSize, true);
+
+        // The task blocks this instance holds, by the id that names them - the
+        // consumer's own half of what a session keeps in the rulebook's table.
+        // An id rather than an address for `freshDeliveries`'s own reason: the
+        // arena recycles a block the moment a release settles, so one address
+        // carries one task's answer and then another's.
+        this.blocks = new Map ();
+
+        // Whether a description has arrived yet, one question per renderer, and
+        // the answer every renderer here waits on: the hole is zeros until the
+        // first mirror, and a game rendered out of zeros where its own capture
+        // would have written is a game drawing a state no run ever held.
+        //
+        // The same question about a STATE BLOCK is gone with the block: nothing
+        // posts one to a consumer, so there is no `stated` to wait on and no
+        // `save` to render off it.
+        //
+        // Two rather than one because a tick may carry either - the speaker is
+        // posted the sound and the picture goes elsewhere - so the two are
+        // answered apart.
+        this.videoStated = false;
+        this.audioStated = false;
+
+        if (! layout) { return; }
+
+        // The one wasm function this instance needs of its own, and the record
+        // that names it. A description carries an ID where a state block
+        // carried a pointer, so a renderer here has to be able to ask - and a
+        // closure is not a wasm function, exactly as it is not one in the
+        // simulation's instance.
+        //
+        // The RECORD's address is the session's, published in the layout beside
+        // the framebuffer's, because this instance lays no arena down. What
+        // goes in it is this instance's own table index, which is why the
+        // record is composed here rather than mirrored across.
+        this.readerPtr = NO_READER;
+        this.readerArmed = false;
+
+        if (trampoline && layout.reader) {
+            this.slots = installTrampoline (trampoline, this.instance,
+                this.services ());
+
+            this.room (layout.reader, LAYOUT.reader.stride);
+
+            const compose = new DataView (this.memory.buffer);
+
+            compose.setUint32 (layout.reader + LAYOUT.reader.context, READER,
+                true);
+            compose.setUint32 (layout.reader + LAYOUT.reader.bytes,
+                this.slots.read, true);
+
+            this.readerPtr = layout.reader;
+        }
+
+        // The second half of the same assertion, and the one a reader of a
+        // failing page can act on: two instances of one module declare one
+        // state size, so a disagreement here is a consumer holding a module
+        // from another build.
+        if (this.stateSize !== layout.stateSize) {
+            refuse (`this consumer's factory declares ${this.stateSize} bytes `
+                + `of state and the simulation's declares ${layout.stateSize}, `
+                + `so the two are not the same module.`);
+        }
+
+        // Room for everything the simulation laid down that this instance
+        // renders into or out of, taken in one go so that the growth cannot
+        // land between a view being built and being read. `render_video` writes
+        // the framebuffer and `render_audio` the samples, so both have to exist
+        // here even though nothing is ever mirrored into them.
+        //
+        // The state block and the save blob are not on the list and no longer
+        // reach this instance at all; the resident regions accepted after this
+        // sit above both, so nothing here has shrunk the memory a renderer is
+        // handed.
+        this.room (layout.samples, SAMPLES_PER_FRAME * 2);
+        this.room (layout.video, FRAME_WIDTH * FRAME_HEIGHT);
+
+        // And the two description holes, at the addresses the simulation chose
+        // for them. The picture always, because a module describing none did
+        // not load; the sound for every module that has one.
+        this.room (layout.videoState, layout.videoStateSize);
+
+        if (layout.audioStateSize) {
+            this.room (layout.audioState, layout.audioStateSize);
+        }
+    }
+
+    // The one service a consumer answers, which is the whole of what a RENDERER
+    // may ask a host for.
+    //
+    // It answers out of `blocks` rather than out of a rulebook, and that is the
+    // difference between this and a session's `read`: a consumer holds copies
+    // of the blocks it was handed, at the addresses they were handed at, and
+    // the id it was handed them under is the whole of its table. What it cannot
+    // do is tell an id nobody ever spawned from one whose block it never
+    // received, so both arrive here as the same sentence.
+    services () {
+        const put = (size, span) => {
+            if (! size) { return; }
+
+            new DataView (this.memory.buffer).setUint32 (size, span >>> 0,
+                true);
+        };
+
+        // The five a body's instance is given, inert here for the reason they
+        // are inert there: the six wrappers land at fixed table indices in
+        // every instance of one module, so an instance that installed one and
+        // one that installed six would disagree about what a number in a record
+        // means.
+        return {
+            spawn: () => 0,
+            done: () => 0,
+            bytes: () => 0,
+            release: () => {},
+            load: () => 0,
+
+            read: (context, id, size) => {
+                put (size, 0);
+
+                if (! context) { return 0; }
+
+                if (context !== READER || ! this.readerArmed) {
+                    refuse (`${this.name} named a task's bytes through a `
+                        + `reader from outside the renderer it was handed to. `
+                        + `A reader is valid for one call and no longer.`);
+                }
+
+                const block = this.blocks.get (id);
+
+                if (! block) {
+                    refuse (`${this.name} was handed a description naming task `
+                        + `id ${id}, whose block this consumer does not hold. `
+                        + `A description names only an id the game held on the `
+                        + `frame it was captured on.`);
+                }
+
+                put (size, block.span);
+
+                return block.address;
+            },
+        };
+    }
+
+    // Enough linear memory for `span` bytes at `at`, which is the whole of what
+    // this class does for itself. `memory.grow` detaches every view over the
+    // buffer - `docs/decisions.md:523` - so every view below is built after the
+    // last growth rather than kept.
+    room (at, span) {
+        const need = at + span;
+        const have = this.memory.buffer.byteLength;
+
+        if (need <= have) { return; }
+
+        this.memory.grow (Math.ceil ((need - have) / 65536));
+    }
+
+    // One region of the simulation's memory, written at its own address. The
+    // state block every tick; the argument storage, the save blob and each task
+    // block once each.
+    accept (address, bytes) {
+        if (! bytes || ! bytes.length) { return; }
+
+        this.room (address, bytes.length);
+
+        new Uint8Array (this.memory.buffer, address, bytes.length).set (bytes);
+    }
+
+    // A task's output, at its own address AND under its own id. The bytes go
+    // where `accept` would put them; what this adds is the row a description
+    // naming that id is answered out of.
+    acceptTask (id, address, bytes) {
+        if (! bytes || ! bytes.length) { return; }
+
+        this.accept (address, bytes);
+
+        this.blocks.set (id, { address, span: bytes.length });
+    }
+
+    // And what the simulation still holds, which is what this instance may go
+    // on answering for.
+    //
+    // THE RETENTION RULE, from the consumer's side. A release is marked and
+    // settles at the next frame boundary, so a row released on frame N is still
+    // in the table when this is called on frame N and is gone when it is called
+    // on frame N + 1 - which is one capture of grace and exactly what
+    // `interface/game.h` promises a description: the block is held until a
+    // description captured after the release has been rendered.
+    //
+    // `held` is `freshDeliveries`'s own map, mutated by it and read here, so
+    // the two ends of the same tick agree about the same set without either
+    // asking the other.
+    retainTasks (held) {
+        for (const id of [...this.blocks.keys ()]) {
+            if (held.has (id)) { continue; }
+
+            this.blocks.delete (id);
+        }
+    }
+
+    // One tick's worth of what this instance renders from: the two descriptions
+    // the simulation captured after the step being shown.
+    acceptDescriptions ({ videoState, audioState }) {
+        if (videoState) {
+            this.accept (this.layout.videoState, videoState);
+
+            this.videoStated = true;
+        }
+
+        if (audioState) {
+            this.accept (this.layout.audioState, audioState);
+
+            this.audioStated = true;
+        }
+    }
+
+    // Whether there is anything to render from yet, per channel.
+    get videoReady () { return this.videoStated; }
+
+    get audioReady () { return this.audioStated; }
+
+    string (at) {
+        const bytes = new Uint8Array (this.memory.buffer);
+        let s = "";
+        for (let i = at; bytes [i]; i++) s += String.fromCharCode (bytes [i]);
+        return s;
+    }
+
+    get name () { return this.string (this.namePtr); }
+
+    get palette () {
+        return new Uint8Array (this.memory.buffer, this.palettePtr,
+            PALETTE_SIZE * 3);
+    }
+
+    get frame () {
+        return new Uint8Array (this.memory.buffer, this.layout.video,
+            FRAME_WIDTH * FRAME_HEIGHT);
+    }
+
+    // The game's own renderer, on the bytes it was handed. `false` for a
+    // consumer that has been given no state yet, so a caller that paints on the
+    // answer paints nothing rather than the zeros a fresh instance begins with.
+    renderVideo () {
+        if (! this.layout || ! this.videoReady) { return false; }
+
+        this.readerArmed = true;
+
+        this.renderVideoFn (this.layout.videoState, this.readerPtr,
+            this.layout.video);
+
+        this.readerArmed = false;
+
+        return true;
+    }
+
+    // One frame of sound, out of the same bytes. Silence for a game that
+    // declares no `render_audio` and for a consumer with no state, which is the
+    // frame of zeros a speaker needs either way.
+    renderSamples () {
+        if (! this.layout || ! this.audioReady || ! this.renderAudioFn) {
+            return new Int16Array (SAMPLES_PER_FRAME);
+        }
+
+        this.readerArmed = true;
+
+        this.renderAudioFn (this.layout.audioState, this.readerPtr,
+            this.layout.samples);
+
+        this.readerArmed = false;
 
         return new Int16Array (new Int16Array (this.memory.buffer,
-            this.samplesPtr, SAMPLES_PER_FRAME));
+            this.layout.samples, SAMPLES_PER_FRAME));
     }
+
+    // AND NO `renderSave` HERE, which is the whole of what this class is not.
+    //
+    // A consumer draws or sounds, out of a description that is plain values;
+    // `save` reads the state block, where every pointer a game kept resolves,
+    // and it is therefore rendered by the instance that steps and by no other.
+    // `Session.renderSave` above is that instance's, and the worker calls it on
+    // the frames the game asks with `game_report_save` - so the one save a
+    // message could not make in time is made before it is needed rather than
+    // out of a mirror. `interface/game.h`'s `Game` block is where the rule is
+    // stated; there is no second half of it here any more.
 }
 
 // ---------------------------------------------------------------------------
@@ -4643,6 +5508,678 @@ function haltChange (before, after) {
     return { shed, run, sound };
 }
 
+// ---------------------------------------------------------------------------
+// What a wall clock instant owes a game: the accumulator, the boundary the
+// input queue is drained to, the cap on a catch-up and the decision that a run
+// may stop.
+//
+// All of it used to live inside the page's animation-frame callback, and all of
+// it is on this side of the line the two files are split along - a timestamp
+// arrives from the browser and pixels and samples leave for it, but between
+// those two the arithmetic is a fixed-timestep loop that has never needed a
+// browser to be right or wrong. Being unreachable without one is what left it
+// checked by nothing: the page's scheduling is executed by no case in the suite,
+// so the clamp, the cap and the drop were three rules stated only in comments.
+// `web_player_steps_on_the_accumulators_clock` is what reads them now.
+//
+// A CLOCK rather than a loop, because the loop is the caller's: something arms
+// an animation frame, hands what it is given to `advance` below, and does what
+// the answer says. What this owns is the BOUNDARY - the instant the next step
+// stands at - and `Input` above says why that is the whole job: the queue is
+// drained by a boundary and a boundary is a step, so a clock that advances
+// boundaries is a clock that steps the game.
+//
+// The session is reached through a function rather than held, which is
+// `watchStore`'s move for `watchStore`'s reason: a reset builds a new session
+// under a page that goes on running, and a clock closed over the retired one
+// would step a game nobody is playing and render samples out of a linear memory
+// nothing is listening to. What deliberately does NOT come back new across that
+// swap is the accumulator - a reset is not a stall, and nothing was owed to it.
+// ---------------------------------------------------------------------------
+
+// WHOSE ANIMATION FRAME DRIVES THIS, which used to be a constant with two
+// values and is now a fact about where the game is stepped.
+//
+// The page used to post every animation-frame timestamp to the worker, take the
+// state back and paint it on its NEXT callback - postback, which cost a whole
+// display frame because the answer arrived after the callback that asked had
+// returned. Beside it stood a phase-locked shape: a timer in the worker, aimed
+// a few milliseconds before where the next vsync was estimated to fall. It was
+// never shipped, because the estimate is a model and a model that aimed low
+// missed the callback by a whole frame - `docs/runs/threaded-host-run.md` (e)
+// measured press to next vsync at p50 23.5 ms on the single-threaded loop, 39.9
+// posting the timestamps, and 27.8 phase-locked with a p90 of 48.5 against
+// postback's 47.6.
+//
+// The worker asks the display for its own frames now, so there is nothing left
+// to estimate: a `requestAnimationFrame` callback inside the worker IS the
+// vsync. `sim.worker.js` runs this clock on that timestamp and publishes what
+// the tick produced, and the page's animation frame is left reading a heartbeat
+// for the watchdog below. The picture is drawn a thread further out, on receipt
+// rather than on a frame of its own, which is
+// `docs/archived/render-worker-plan.md`'s one display frame of latency and the
+// only clock in this player that is not the display's.
+//
+// `docs/runs/drawing-worker-run.md` is what measured that a worker may have one:
+// a worker's animation frame ran at p50 16.7 ms over 301 samples in Chrome 152
+// and p50 17 over 288 in Safari 26.6.2, both with zero intervals over a frame
+// and a half, and both are the display's own cadence rather than a timer's. The
+// same log records the two things that follow. The display is NOT the
+// simulation's rate - it read 120 Hz in one reading and 60 Hz in another on one
+// panel - so a frame callback owes whatever `advance` below says it owes and
+// often nothing. And a hidden tab stops a worker's animation frame dead in
+// Chrome while leaving its timer unthrottled, which is why the halt that stops
+// the worker asking is load bearing rather than tidy.
+
+class Clock {
+    // `session` is a function answering with the session that is playing NOW,
+    // for the reason above. `audio` is handed one step's `Game_Report` from
+    // inside the burst rather than a list to walk afterwards, and it has to be:
+    // a frame of samples is rendered out of the state the step it belongs to
+    // left behind, and the next step overwrites that state.
+    //
+    // The rate is a parameter because it is the one number here that is not
+    // this clock's own. It is `game_frame_rate` - the contract's, sized into
+    // `Game_Audio_Block` and hashed into every golden - so a host that passed a
+    // different one would be running a game the recording cannot reproduce.
+    constructor (session, input, audio, rate = FRAME_RATE) {
+        this.session = session;
+        this.input = input;
+        this.audio = audio;
+        this.rate = rate;
+
+        this.accumulator = 0;
+        this.last = 0;
+
+        // The wall clock instant this step's boundary stands at. It advances in
+        // whole frames and is never reset to `now`, so it stays behind the wall
+        // clock by at most the accumulator's remainder - the one exception is
+        // the backlog drop below, which is where a machine that cannot keep up
+        // gives up the lag rather than carrying it.
+        this.simTime = 0;
+    }
+
+    // Forget the interval that has not been lived through, so the next
+    // `advance` takes its own timestamp as the origin and owes nothing for the
+    // gap before it. Two callers have a reason to, and the page holds both.
+    prime () {
+        this.last = 0;
+        this.accumulator = 0;
+    }
+
+    // One animation frame's worth of simulation, and what the page owes the
+    // screen and the halt table because of it.
+    //
+    // `stepped` is how many steps ran, `held` is whether every one of them
+    // claimed `game_report_still`, `idle` is whether the run may now stop, and
+    // `asked` is whether any one of them asked for its save with
+    // `game_report_save`. Nothing here paints, nothing here saves and nothing
+    // here halts: all three are the page's or the worker's, because all three
+    // are the browser's.
+    //
+    // `asked` is an OR over the burst where `held` is an AND over it, and the
+    // asymmetry is the two flags' own: a run of still frames is broken by one
+    // step that moved a pixel, and a request is made by one step that moved a
+    // byte. A tick that ran eight steps renders ONE blob for all of them, which
+    // is what `save` being a pure function of the state block allows - the
+    // bytes at the end of the burst are the bytes every request in it was about.
+    advance (now) {
+        const session = this.session ();
+
+        // The first frame after a prime, which is a timestamp and no interval.
+        if (! this.last) {
+            this.last = now;
+            this.simTime = now;
+
+            return { stepped: 0, held: true, idle: false, asked: false };
+        }
+
+        let delta = (now - this.last) / 1000;
+        this.last = now;
+
+        if (delta > 0.25) delta = 0.25;         // never spiral after a tab switch
+        this.accumulator += delta;
+
+        // `held` is every step so far having reported `game_report_still`, which
+        // is what the screen path can be skipped on: the canvas holds the last
+        // frame painted, and a run of still frames is what connects it to the
+        // state now. One step in the burst that moved a pixel breaks the run,
+        // whatever the steps after it claim, because the frame finally drawn is
+        // the last state rather than the last claim.
+
+        let stepped = 0, held = true, asked = false, rested = false;
+
+        while (this.accumulator >= 1 / this.rate && stepped < 8) {
+            this.input.applyUpTo (this.simTime);
+
+            const report = session.advance (this.input.buttons,
+                this.input.edges, this.input.pointer);
+
+            this.input.clearEdges ();
+
+            held = held && (report & REPORT.still) !== 0;
+            asked = asked || (report & REPORT.save) !== 0;
+
+            // Every step renders its own frame of samples, so this belongs
+            // inside the loop rather than after it: a catch-up of eight steps
+            // owes the audio thread eight frames of sound, and taking only the
+            // last would drop seven - the same mistake the input queue exists to
+            // avoid. A frame reported silent owes it a frame of silence, which
+            // is the one that costs no `render_audio` call and no buffer.
+            this.audio (report);
+
+            this.simTime += 1000 / this.rate;
+            this.accumulator -= 1 / this.rate;
+            stepped++;
+
+            // The rest of this catch-up would be steps that change nothing, so
+            // it is not run. `game_report_idle` is self propagating - `step` is
+            // a pure function of state, input and what the runner answers - and
+            // the input the remaining steps would advance their boundary onto is
+            // exactly what `waiting` below refuses to sleep through.
+            if (report & REPORT.idle) { rested = true; break; }
+        }
+
+        // The step cap was reached with work still owed, so this machine cannot
+        // keep up. Drop the backlog rather than carry it: left to accumulate,
+        // simulated time falls permanently behind the wall clock, and every
+        // queued key then has to wait out that lag before a step will take it.
+        // Dropping costs some skipped frames, which is what a machine this far
+        // behind was going to show anyway.
+        //
+        // Not when the break above was a game resting: the owed time is forgiven
+        // on the way back out of rest instead, and applying input up to now here
+        // would latch an edge into a queue that is about to have nothing
+        // draining it.
+
+        if (! rested && this.accumulator >= 1 / this.rate) {
+            this.accumulator = 0;
+            this.simTime = now;
+            this.input.applyUpTo (this.simTime);
+        }
+
+        // The game says nothing more is coming until something happens to it,
+        // and nothing has.
+        //
+        // Two things can already have happened by the time this is read, and
+        // both are the same shape: something arrived that the step which made
+        // the claim could not have seen. An input event queued behind that
+        // step's boundary is one - `waiting` is what asks. A task's answer,
+        // staged on its own message between animation frames rather than on this
+        // frame's work, is the other. Both are shown or drained by a step, so
+        // sleeping through either would strand it with nothing running.
+        const idle = rested && ! this.input.waiting ()
+            && ! session.stagedTasks ().length;
+
+        return { stepped, held, idle, asked };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The watchdog: a simulation that has stopped answering, named and stopped.
+//
+// `docs/decisions.md` pending item 10, and the cost it names was paid one
+// milestone ago: "A watchdog for the web player. The mechanism is measured; the
+// cost is moving the frame loop into a worker. It need not exfiltrate state - a
+// hung page can report the frame and the input log it already records for Mark,
+// and `inspector dump --replay ... --budget` reconstructs everything natively."
+//
+// A `step` that never returns used to wedge the page with nothing able to say
+// so: the loop, the listeners, the canvas and the game were one thread, and the
+// thread that would have to notice was the thread that was gone. The simulation
+// is a worker now, so the page is awake while the game is not - and a worker is
+// a thing the page can end.
+//
+// WHAT IT WATCHES is a HEARTBEAT read on the page's own clock. The worker asks
+// the display for its own frames and posts one frame message per callback,
+// whether or not that instant owed a step, and the page runs an animation frame
+// of its own that posts nothing at all: it stamps each callback as the oldest
+// instant nothing has been heard since, and a frame message clears it. So the
+// question "is the simulation still there" is "has anything come back since the
+// oldest frame I read", which needs no clock but the page's own animation frame
+// and asks the worker for nothing it was not already going to say.
+//
+// IT WAS A ROUND TRIP, and the two shapes are the same arithmetic under
+// different words: the page posted a timestamp per frame and the worker answered
+// each one. What changed is only who owns the clock - a page that no longer
+// steps the simulation has nothing to post, and a heartbeat the worker sends
+// anyway is the same evidence for free.
+//
+// ARMED BY THE FIRST ANSWER, never before it. A worker that has not answered
+// yet is a worker still compiling the module, laying down an arena and running
+// `construct`, or - under node, where the shim fetches `player.js` over HTTP
+// before the file even evaluates - not yet running at all. None of that is a
+// hang and all of it is unbounded, so the budget below would be a guess about a
+// network rather than a reading of a game. What that costs is stated rather
+// than hidden: a `construct` that never returns is OUTSIDE this watchdog, and
+// it is the only thing left that is.
+//
+// A `render_video` THAT NEVER RETURNS IS NOT THIS WATCHDOG'S ANY MORE, and
+// that is the whole of what moving the picture onto a thread of its own did to
+// this file. It was outside the watchdog while the page drew, for a structural
+// reason rather than an omission - the thread that would have had to report the
+// hang was the thread it wedged - and inside it for as long as the simulation
+// drew. The renderer is a third thread now with a heartbeat of its own, so a
+// picture that never comes back stops THAT heartbeat and this one goes on
+// arriving. `RenderWatch` below is the rule that reads it, and the difference
+// between the two is what each one means: a simulation that stops answering is
+// the run ending, and a renderer that stops answering is a renderer replaced.
+//
+// DISARMED BY EVERY HALT, and that is a reading rather than a courtesy.
+// `docs/runs/threaded-host-run.md` (b) measured a worker's timer in a
+// BACKGROUND tab at p99.9 766 ms between ticks and a worst gap of 1,584 ms,
+// against 25.6 ms at p99.9 with the tab in front. A watchdog left armed through
+// `hidden` would report a hang every few seconds on a tab nobody is looking at,
+// terminate the run and lose it. A halt tells the worker to stop asking the
+// display for frames, so a halted run posts no heartbeat and owes no answer -
+// and the page's own frame loop stops with it, which is what forgets the
+// pending instant. `docs/runs/drawing-worker-run.md` (b) is the reading that
+// makes the first half load bearing: Chrome stops a hidden tab's worker
+// animation frame outright and Safari throttles it to about nine ticks a
+// second, so a watchdog left armed would be reading the browser rather than the
+// game.
+// ---------------------------------------------------------------------------
+
+// How long the page waits for an answer before it decides there will not be
+// one. Fixed, and not adaptive: a watchdog whose budget follows the machine is a
+// watchdog that grows one on the machine it is meant to report.
+//
+// WHAT IT TOLERATES. A frame is 16.667 ms and one animation frame owes at most
+// eight steps, so an ordinary tick is one to eight steps, one picture and a
+// message out. `docs/decisions.md` measures the whole of a game natively at
+// under ~72 µs a frame - `step` ~2.2 µs, `render_audio` ~20, `render_video` 5 to
+// 50 - so eight steps is well under a millisecond of arithmetic, and this budget
+// is about fourteen thousand times the worst frame anybody here has measured.
+// The picture is on this path too now, and deliberately inside the budget rather
+// than beside it: `render_video`, the palette conversion and the `putImageData`
+// all run on the thread that steps, so what this reports is a frame rather than
+// half of one. It is also
+// sixty display frames, and `docs/runs/threaded-host-run.md` (b) puts a visible
+// worker's worst gap at 26.1 ms over 3,598 samples on a machine at a one-minute
+// load of 24. A body spawning is not on this path either: six `new Worker` calls
+// on the simulation's own thread are 22-23 µs each in a browser, measured in
+// `docs/decisions.md`, and the body runs somewhere else.
+//
+// WHAT IT DOES NOT TOLERATE is a step that legitimately takes over a second, and
+// nothing in this tree writes one. `games/drop-four` is the game that came
+// closest and is the reason the sentence is worth writing down: it thinks with a
+// minimax search, and it spends a bounded number of nodes per frame and carries
+// its stack in the state block precisely so that the frame rate is safe on every
+// machine. A game that wanted a second of arithmetic per step would have to be
+// resumable in that same way, because a 60 Hz console cannot show it anyway.
+//
+// It is `inspector --budget`'s own number, deliberately: the report below names
+// the command that reproduces the hang natively, and a page that reported a
+// stall the native watchdog then declined to see would be two watchdogs
+// disagreeing about one game.
+const WATCHDOG_MS = 1000;
+
+class Watchdog {
+    constructor (budget = WATCHDOG_MS) {
+        this.budget = budget;
+
+        // Nothing is watched until something has come back. See above.
+        this.armed = false;
+
+        // The page's own timestamp on the oldest posted tick nothing has
+        // answered, or null while the simulation is up to date.
+        this.pending = null;
+
+        // Frames the worker has reported completing. It is a COUNT, so it is
+        // also the zero-based index of the frame it is running now, and one
+        // less than the `frame` line a recording needs to reach it.
+        //
+        // ONE NUMBER RATHER THAN TWO, and that is what moving the picture off
+        // this worker's thread simplified. A frame used to be a step and then a
+        // picture, so a heartbeat missing could mean either and the count was
+        // one short when it was the picture; the thread this watches only steps
+        // now, so a heartbeat that stops is a `step` that never returned and
+        // `stallLine` below has one frame to name.
+        this.completed = 0;
+    }
+
+    // A frame message: the worker is alive, and this is where it has got to.
+    answered (completed) {
+        this.armed = true;
+        this.pending = null;
+        this.completed = completed;
+    }
+
+    // The page read its own animation frame and nothing had come back. Only the
+    // oldest such instant is kept, so an answer that belongs to some other
+    // message - the frame a pause costs is the one that exists - clears the wait
+    // rather than confusing the count.
+    posted (now) {
+        if (this.armed && this.pending === null) { this.pending = now; }
+    }
+
+    // A pause, a hidden tab, a resting game, a reset: nothing is owed.
+    disarm () { this.pending = null; }
+
+    // Null while the simulation is answering, and what to report when it is not.
+    overdue (now) {
+        if (this.pending === null) { return null; }
+
+        const waited = now - this.pending;
+
+        if (waited < this.budget) { return null; }
+
+        return { frame: this.completed, waited };
+    }
+}
+
+// What the page says about it, in one sentence, because the page has one line
+// to say it on and a person reading it has a `.replay` file in their downloads.
+//
+// Here rather than in the page for the reason the refusal text is: what a host
+// SHOWS is the browser's and what it says is not. The command beside it is the
+// whole of pending item 10's second half.
+//
+// `shot` RATHER THAN `dump`, and one frame rather than two. What this watchdog
+// reports is a `step` that never returned, because the thread it watches is the
+// thread that steps and nothing else - a `render_video` that never returns
+// wedges the render worker, which is a different thread with a heartbeat of its
+// own. So there is one number to name, and `inspector dump` would reproduce it:
+// `shot` is named anyway because it steps to the frame AND renders, so the
+// person who runs it gets the picture of the frame that stopped for free and
+// gets told if the render is wedged too.
+// `products/web-player/tests/watchdog.js` runs it.
+function stallLine (stall, budget = WATCHDOG_MS) {
+    return `the simulation stopped answering while it was running frame `
+        + `${stall.frame}. Nothing came back for ${Math.round (stall.waited)} `
+        + `ms, so its worker was terminated and the recording beside this was `
+        + `written. \`inspector shot --replay <that file> --budget ${budget} `
+        + `--out <a png>\` on the native plug-in reproduces it, at frame `
+        + `${stall.frame}.`;
+}
+
+// ---------------------------------------------------------------------------
+// The renderer's own watchdog: a picture that never came back.
+//
+// THE SAME ARITHMETIC AND A DIFFERENT VERDICT, which is the whole reason this
+// is a class beside `Watchdog` rather than a second instance of it. A
+// simulation that stops answering is the run ending and there is nothing else
+// to do about it; a renderer that stops answering is a thread holding a canvas
+// and an instance of a module, and the page can end it and build another while
+// the game plays on. That is what `docs/archived/render-worker-plan.md` bought
+// with a display frame of latency, and this is the half of it the page owns.
+//
+// IT COUNTS ONLY WHILE A PICTURE IS OWED, and that is the one rule `Watchdog`
+// does not have. The simulation publishes on a tick that stepped and did not
+// claim `game_report_still`, so a resting game, a game whose pixels have not
+// moved and a halted page all publish nothing - and a renderer that has drawn
+// nothing because nothing was posted to it is idle rather than wedged. So the
+// question this asks is not "has anything come back" but "is the newest picture
+// the simulation published still undrawn", which is two frame numbers and their
+// difference. A renderer merely BEHIND is not wedged either: every draw clears
+// the wait, so what has to happen for this to fire is a whole budget in which a
+// published picture went undrawn and no heartbeat arrived at all.
+//
+// ARMED BY THE RENDERER SAYING IT IS OPEN, which is `render.worker.js`'s
+// `ready` and the one place this differs from the watchdog above. That one arms
+// on its first ANSWER, because a simulation answers every display frame whether
+// or not it stepped; a renderer answers only when it has drawn, and the subject
+// this exists to catch is a renderer that never draws once - so an arming rule
+// that waited for a draw would be a rule that never fires on the only case that
+// matters. `ready` is posted when the instance is compiled and the canvas is in
+// hand, so everything before it - the worker's own fetch, its `importScripts`,
+// the compile - is outside this exactly as a `construct` is outside the other.
+//
+// ONE REPLACEMENT PER SESSION, and `replaced` is where that is remembered
+// rather than in the page, because it is a fact about the run and the page
+// already throws this away on a reset. A renderer that hangs twice is a game
+// that hangs, and an unbounded loop would hide it; the second stall ends the
+// run through the same `seize` a simulation's does, saying
+// `renderStallLine` instead.
+// ---------------------------------------------------------------------------
+
+class RenderWatch {
+    constructor (budget = WATCHDOG_MS) {
+        this.budget = budget;
+
+        // Nothing is watched until the renderer has said it is open. See above.
+        this.armed = false;
+
+        // The page's own timestamp on the oldest instant at which a published
+        // picture was undrawn, or null while the renderer is up to date.
+        this.pending = null;
+
+        // The newest frame the simulation published a picture for, and the
+        // newest frame the renderer said it drew. Both are the frame COUNT the
+        // simulation stamped the description with, so they are comparable, and
+        // the second can only trail the first.
+        this.shown = 0;
+        this.drawn = 0;
+
+        // Whether this session has already spent its one replacement.
+        this.replaced = false;
+    }
+
+    // The renderer has compiled its instance and holds the canvas.
+    opened () { this.armed = true; }
+
+    // The simulation published a picture for this frame. Read off the frame
+    // message's own `stepped` and `held`, which is `present`'s rule one thread
+    // over: the page recomputes it rather than being told, because the two
+    // skips are already on every frame message and a third field would be the
+    // same fact twice.
+    published (frame) { this.shown = frame; }
+
+    // And the renderer drew one, which is its heartbeat. What it clears is the
+    // wait rather than the debt: a renderer running a frame behind is alive,
+    // and the next callback stamps a new instant if it is still behind.
+    drew (frame) {
+        this.drawn = frame;
+        this.pending = null;
+    }
+
+    // The page read its own animation frame. Only the oldest instant at which
+    // something was owed is kept, exactly as the watchdog above keeps it.
+    posted (now) {
+        if (! this.armed || this.drawn >= this.shown) { return; }
+
+        if (this.pending === null) { this.pending = now; }
+    }
+
+    // A pause, a hidden tab, a resting game, a reset: nothing is owed.
+    disarm () { this.pending = null; }
+
+    // Null while the renderer is keeping up, and what to report when it is not.
+    // The frame named is the one the picture was owed FOR, because that is the
+    // description the wedged instance was rendering and therefore the frame a
+    // recording has to reach to reproduce it.
+    overdue (now) {
+        if (this.pending === null) { return null; }
+
+        const waited = now - this.pending;
+
+        if (waited < this.budget) { return null; }
+
+        return { frame: this.shown, drawn: this.drawn, waited };
+    }
+
+    // The page has ended that thread and built another. The picture the dead
+    // renderer never drew is not owed by the one that replaced it - a fresh
+    // instance is handed the NEXT description the simulation publishes and
+    // draws that - so the debt is cleared here rather than carried into a
+    // worker that was never asked for it.
+    replace () {
+        this.replaced = true;
+        this.armed = false;
+        this.pending = null;
+        this.drawn = this.shown;
+    }
+}
+
+// What the page says when a renderer has stopped twice, which is the one render
+// stall that ends a run.
+//
+// It names the frame the picture was owed for rather than the frame the
+// simulation had reached, and the two are not the same number: the simulation
+// goes on stepping for the whole budget while the renderer is silent, so by the
+// time this is composed it is a second ahead. A recording that reaches the
+// later frame would reproduce the wrong render, so `frame` here is the
+// description that wedged and the count `seize` writes is the same number.
+//
+// `shot` for `stallLine`'s own reason, and more plainly: the command has to
+// RENDER to reproduce this at all, and `inspector dump` renders nothing.
+// `products/web-player/tests/watchdog.js` runs it.
+function renderStallLine (stall, budget = WATCHDOG_MS) {
+    return `the picture stopped for the second time in this session, while the `
+        + `renderer was drawing frame ${stall.frame}. Nothing came back for `
+        + `${Math.round (stall.waited)} ms, and a renderer that hangs twice is `
+        + `a game that hangs - so the run was ended and the recording beside `
+        + `this was written. \`inspector shot --replay <that file> --budget `
+        + `${budget} --out <a png>\` on the native plug-in reproduces it, at `
+        + `frame ${stall.frame}.`;
+}
+
+// ---------------------------------------------------------------------------
+// A recording, as the file a person reads.
+//
+// Space separated lines rather than JSON: the readers are C and this file, and
+// a line format costs six lines here while saving a hand written JSON parser on
+// the other side - the code standing between a corrupt replay and a silently
+// wrong one. Readers split on the first run of whitespace, so a value may
+// contain spaces and no quoting rule is needed. `products/mark/source/mark.h`
+// is the format, whole.
+//
+// BELOW THE BROWSER LINE because the page is no longer the only caller. Mark is
+// one and the watchdog is the other, and the watchdog's recording is the half of
+// pending item 10 a person actually uses - so it is composed where a case can
+// read it rather than inside a `Blob` and an anchor click. What is left in the
+// page is the two browser calls that put the text in a file.
+//
+// WHAT IT IS GIVEN is a record the page has been ACCUMULATING rather than one it
+// asked for. A hung worker answers no message, so a page that asked would get
+// nothing at exactly the moment it needed everything; and the same move is what
+// already lets a closing tab write its save with no round trip left to take.
+// The simulation posts the new log entries with every frame and the page keeps
+// them, so the record is complete at every instant, including the last one
+// before a thread stopped existing.
+// ---------------------------------------------------------------------------
+
+function markText (name, version, record) {
+    // The `seed` line is the number this run really used: the address bar
+    // carries it by the time a frame has been drawn, whether a reader wrote it
+    // or `composeRun` rolled it, so a recording reproduces a run rather than
+    // re-rolling it - by construction rather than by a rule somebody has to
+    // remember.
+    //
+    // Then one `arg <name> <value>` line per pair this run passed through,
+    // sorted by name, which is the order they were delivered in - a recording
+    // and a delivery are one list, so a reader on another machine produces the
+    // same bytes and the same array. An EMPTY value is the name with nothing
+    // after it, which is the format's own spelling for the one value that is
+    // not absence, and a bare run writes no `arg` line at all - a reader that
+    // finds none supplies none.
+    //
+    // The `save` line between them carries the blob this run was CONSTRUCTED
+    // from, and only where that blob had a non-zero byte. It is what was
+    // delivered rather than a reference to the store it came out of, so a mark
+    // taken here reproduces on a machine whose `localStorage` holds something
+    // else or nothing at all - and a run handed nothing writes no line, which
+    // is why every replay in this tree older than the record is still valid
+    // unchanged. `Session.saveLines` holds both halves of that rule.
+    const lines = [
+        `game ${name}`,
+        `version ${version.join (".")}`,
+        `seed ${record.seed}`,
+        ...record.saveLines,
+        ...record.argLines,
+        `frame ${record.frameIndex}`,
+    ];
+
+    // Merged by frame rather than one log after the other. Both readers keep a
+    // cursor per record kind, so either order parses - but a file read by a
+    // person should run forwards in time.
+    //
+    // A task's answer is recorded beside the buttons because it is the same
+    // kind of thing: an edge at a frame boundary that the game branches on. The
+    // game SAMPLES a level rather than catching that edge, but the frame the
+    // level changes on is still the host's decision, so a replay that left it
+    // out would reproduce the run with the answers never arriving,
+    // deterministically and wrongly. A failure is recorded for the stronger
+    // version of that reason - an absence cannot be pinned at all, so a run
+    // where a task never answered is replayable only as a record.
+    //
+    // By ID rather than by name, and nothing else about a task goes in: a
+    // descriptor carries a name nothing resolves through, and the spawn
+    // re-fires from the same state on the same frame - so a replay runs the
+    // body again and regenerates the output rather than carrying a
+    // computation's answer in a file meant to outlive the build that made it.
+    //
+    // A RESOURCE has no record of its own here and never will: a body reads a
+    // file off the frame and a replay re-runs the body, so there is no schedule
+    // to reproduce. What pins the bytes is the identity a completion carries -
+    // the filename the host handed the body, its length and a fold of it.
+    //
+    // Every record this page writes says `none` there, which is the format's
+    // spelling for "this record pins no delivery", and it is honest rather than
+    // lazy: the page FETCHES over HTTP and holds decoded bytes rather than
+    // files it read, so it has nothing to fold and no filename to fold it
+    // under. A reader cannot tell that from a body that was handed no file, and
+    // is not meant to - both mean there is nothing here to check against. So a
+    // recording taken here replays and verifies nothing about its resources,
+    // which is exactly what the page could say about them before.
+    //
+    // The pointer is here for the first reason and is written as a change, like
+    // `input`: a position is piecewise constant, so a record means "here from
+    // this frame until the next one". Leaving the screen is written as `away`
+    // rather than as a position nobody is at, because absence is a thing the
+    // reader has to reproduce and every coordinate on the screen is a legal one.
+    const records = [
+        ...record.inputLog.map (e =>
+            ({ frame: e.frame, kind: "input", text: e.buttons.join (" ") })),
+        ...record.tapLog.map (e =>
+            ({ frame: e.frame, kind: "tap", text: e.buttons.join (" ") })),
+        ...record.taskLog.map (e =>
+            ({ frame: e.frame, kind: e.kind, text: `${e.id} none` })),
+        ...record.pointerLog.map (e => ({ frame: e.frame, kind: "pointer",
+            text: e.present ? `${e.x} ${e.y}` : "away" })),
+    ].sort ((x, y) => x.frame - y.frame);
+
+    for (const entry of records) {
+        lines.push (`${entry.kind} ${entry.frame}`
+            + (entry.text ? ` ${entry.text}` : ""));
+    }
+
+    return lines.join ("\n") + "\n";
+}
+
+// The four logs, empty, beside what a run was told before frame 0. One page-side
+// record per session, filled by `openRecord` when the simulation answers with
+// what it was constructed from and grown by `growRecord` on every frame after.
+
+function openRecord (opened) {
+    return {
+        seed: opened.seed,
+        saveLines: opened.saveLines,
+        argLines: opened.argLines,
+        frameIndex: 0,
+        inputLog: [],
+        tapLog: [],
+        taskLog: [],
+        pointerLog: [],
+    };
+}
+
+// What one frame message adds. The simulation sends only the entries its logs
+// grew by, which is what keeps this O(1) a frame rather than O(n): a pointer
+// game moved for ten minutes appends 36,000 entries, and a page told the whole
+// log every frame would be copying all of them 36,000 times.
+
+function growRecord (record, frame, fresh) {
+    record.frameIndex = frame;
+
+    for (const entry of fresh.input) { record.inputLog.push (entry); }
+    for (const entry of fresh.tap) { record.tapLog.push (entry); }
+    for (const entry of fresh.task) { record.taskLog.push (entry); }
+    for (const entry of fresh.pointer) { record.pointerLog.push (entry); }
+
+    return record;
+}
+
 // The smallest scale there is. One device pixel per console pixel is already
 // unreadable on any modern display, and below it a console pixel would be a
 // fraction of a screen pixel, which is the smearing whole multiples exist to
@@ -5355,13 +6892,15 @@ if (typeof module !== "undefined") {
         REPORT, WASM_MAGIC, MIN_SCALE,
         onRefusal, refuse, fetchModule, fetchTrampoline, fetchCore,
         installTrampoline, HostCore,
-        Session,
+        Session, Consumer, freshDeliveries,
         SAVE_KEY_PREFIX, SAVE_PERIOD, saveHex, SaveStore, watchStore,
         dayNumber,
         resourceBase, composeRun, queryArguments, argumentList,
         runTaskBody, TaskRunner, sizeClass,
         Input, pointerPixel, canvasScale, gridSnap, pageZoom, layoutChange,
-        halted, haltChange,
+        halted, haltChange, Clock,
+        WATCHDOG_MS, Watchdog, stallLine, RenderWatch, renderStallLine,
+        markText, openRecord, growRecord,
         paint, paletteEntries, luminance, contrast, theme, resourceLine,
         taskLine, controlsLine, fillLegends,
         consolePcm, decodeResource, resourceReader, stringAt,
