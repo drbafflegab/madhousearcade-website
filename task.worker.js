@@ -17,17 +17,17 @@
 // is three compiled modules - the game's, the host's own trampoline and the
 // rulebook - a resource directory, a descriptor and an input; what it sends
 // back is the bytes the body wrote, or a null and a line saying why there are
-// none, plus what the body read on its way. Which of those becomes the null the
-// runner's `bytes` answers with is the session's business, and the session is on
+// none, plus what the body loaded on its way. Which of those becomes a failed
+// `status` is the session's business, and the session is on
 // the other thread.
 //
 // THE RULEBOOK IS HERE FOR ONE RULE and no session at all. A body reads files,
 // and the six shape-and-length rules a `Game_Resource` is held to are spent
 // inside the read that named one - on this thread, in the body's own instance,
 // where the strings live. Everything else `products/host-core` owns is about a
-// TASK rather than about a body: the table, an id's validity, the release table
+// TASK rather than about a body: the table, an id's validity, the store
 // and the runner's stamps all belong to the session, and a body's own `spawn`,
-// `done`, `bytes` and `release` are inert wrappers because `interface/game.h`
+// `status` and `finalize` are inert wrappers because `interface/game.h`
 // says a body reads
 // files and cannot spawn. So what crosses is a compiled module, and this thread
 // instantiates a memory of its own for it.
@@ -89,7 +89,8 @@ let heldCore = null;
 let read = null;
 
 self.onmessage = (event) => {
-    const { id, module, trampoline, core, task, input, resources } = event.data;
+    const { id, module, trampoline, core, task, input, resources,
+        maxResourceCount } = event.data;
 
     if (module) {
         held = module;
@@ -112,22 +113,29 @@ self.onmessage = (event) => {
         // same, because a body that cannot be run and a body that trapped are
         // one condition to the game - no output is coming - and a throw here
         // would leave the session waiting for a message that never arrives.
-        self.postMessage ({ id, output: null, reads: [],
-            note: 'the worker was sent a task before a module' });
+        self.postMessage ({ id, output: null, reads: [], loads: [],
+            unloads: [], note: 'the worker was sent a task before a module' });
 
         return;
     }
 
-    const answer = runTaskBody (held, heldTrampoline, heldCore, task, input,
-        read);
+    const answer = runTaskBody (held, heldTrampoline, heldCore, id, task,
+        input, read, maxResourceCount);
 
     // Transferred rather than copied, as the decoder's samples are: an output
-    // is whatever size its author declared, and a task that answers with a
-    // table is the case this subsystem exists for.
+    // is whatever size its author declared, and a resource is whatever size its
+    // file is. THIS THREAD MATERIALISES NOTHING: a scope names the simulation
+    // and the renderers and never a body, so what a body loaded crosses back
+    // once and the session puts it where its scope says.
     //
-    // `reads` goes across copied, because it is a handful of short strings and
-    // a host's account of what happened rather than the answer.
-    self.postMessage (
-        { id, output: answer.output, note: answer.note, reads: answer.reads },
-        answer.output ? [answer.output.buffer] : []);
+    // `reads` and `unloads` go across copied, because they are a handful of
+    // short strings and numbers.
+    const loads = answer.loads || [];
+
+    const transfer = loads.map (load => load.bytes.buffer);
+
+    if (answer.output) { transfer.push (answer.output.buffer); }
+
+    self.postMessage ({ id, output: answer.output, note: answer.note,
+        reads: answer.reads, loads, unloads: answer.unloads || [] }, transfer);
 };

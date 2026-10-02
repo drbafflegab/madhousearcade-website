@@ -5,6 +5,39 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>madhousearcade</title>
 <style>
+  /* ABC Areal, self-hosted as one variable WOFF2 under Dinamo's free fonts
+     licence - §9.12, which carries the web licence of §9.5, where WOFF2, one
+     domain, self-hosting and subsetting are all named. The file is cut to the
+     206 codepoints these pages can contain: Latin-1, the quotes and dashes,
+     and the eight arrows the player's legends draw with. That takes the
+     shipped 177 KB to 60 KB with every axis still in it.
+
+     Every axis is kept rather than pinned, and that is the licence talking
+     rather than the design: §9.5 names subsetting and nothing anywhere names
+     instancing, so dropping an axis is the one saving available here that the
+     terms do not clearly allow. It would have taken off more than half again.
+
+     Named `areal.woff2` rather than rooted at `/`, because the site is
+     also served from a directory in the preview and a game's page sits one
+     level down - the same reason `game.html.in` reaches the player as `../`.
+
+     `format("woff2")` and not `woff2-variations`: that spelling was withdrawn,
+     and a browser that does not know it discards the whole source.
+
+     The fallback is Arial because Areal IS Arial, redrawn from it, which
+     makes the swap `font-display` permits about as small as a swap gets:
+     `Madhouse Arcade 0123` sets 137.1 px in Areal against 138.0 in Arial at
+     13 px, a drift of 0.7%. The monospace stack this replaced set the same
+     string at 156.5 px, so the menu tightened by 14% the day it changed. */
+  @font-face {
+      font-family: "ABC Areal";
+      src: url("areal.woff2") format("woff2");
+      font-weight: 400 700;
+      font-style: oblique 0deg 12deg;
+      font-display: swap;
+  }
+
+
   :root {
       color-scheme: dark;
 
@@ -35,7 +68,13 @@
               rgba(120, 120, 190, 0.16), transparent 70%);
       background-repeat: no-repeat;
       color: var(--text);
-      font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+      font: 13px/1.6 "ABC Areal", Arial, Helvetica, sans-serif;
+      /* After the shorthand, never before it: `font` resets
+         `font-variation-settings` to normal. The page is dark at every
+         hour - `color-scheme` below is unconditional - so the typeface's
+         `DRKM` axis, which thins the stems that light-on-dark thickens,
+         is simply on rather than hung off a media query. */
+      font-variation-settings: "DRKM" 1;
       display: flex; flex-direction: column; align-items: center;
       gap: clamp(22px, 4vw, 32px);
   }
@@ -63,9 +102,10 @@
           transparent, var(--edge-lit), transparent);
   }
 
-  /* One shape for every card, because the console is square and so is every
-     cover. `auto-fit` rather than a column count: the menu is a listing of a
-     directory, so the page cannot know how many games it is laying out. */
+  /* One shape for every card, because every cover is square whatever frame
+     its game declares. `auto-fit` rather than a column count: the menu is a
+     listing of a directory, so the page cannot know how many games it is
+     laying out. */
   ul { list-style: none; margin: 0; padding: 0;
        width: 100%; max-width: 900px;
        display: grid; gap: clamp(12px, 2vw, 20px);
@@ -81,14 +121,16 @@
   }
 
   /* Square whatever arrives. The width and height attributes already say 800 by
-     800, but the same element also shows a 240 by 240 clip, and a card that
-     changed size on hover would move every card after it. */
+     800, but the same element also shows a clip cut at the game's own frame -
+     240 by 240 unless the game declares another - and a card that changed
+     size on hover would move every card after it. */
   .cover { display: block; width: 100%; height: auto; aspect-ratio: 1 / 1;
            object-fit: cover; }
 
   /* Only while the clip is showing. The cover is 800 by 800 artwork drawn for a
-     card this size and wants the browser's smoothing; the clip is a 240 pixel
-     console frame scaled up to the same box and wants none of it.
+     card this size and wants the browser's smoothing; the clip is a console
+     frame, 240 pixels a side unless its game declares another, scaled up to
+     the same box and wants none of it.
 
      THE PICTURE IS CUT, NOT BLENDED, and that is the second thing tried rather
      than the first. A 150 ms crossfade went in first, on the reasoning that a
@@ -105,8 +147,18 @@
 
      A cut needs none of that: one element, one layer, one picture at a time,
      nothing behind anything. The only thing animated on this page is the size,
-     and the only thing that changes about the picture is which one it is. */
-  .cover.playing { image-rendering: pixelated; }
+     and the only thing that changes about the picture is which one it is.
+
+     CONTAINED RATHER THAN COVERED while it plays, because a game may declare a
+     frame that is not square and the clip is cut at that frame. `cover` would
+     crop a tall clip to its middle and hide the shape the game chose, on the
+     one surface that advertises it; `contain` shows all of it and leaves bars
+     on the two short sides. The bars are the card's own `--card` background
+     showing through the image box, since nothing is painted behind the image
+     any more. A square clip fills the box either way, so every game that
+     declares nothing looks exactly as it did; the cover stays `cover` and
+     square, as `docs/decisions.md` requires of it. */
+  .cover.playing { image-rendering: pixelated; object-fit: contain; }
 
   /* Nothing happens unless a pointer can actually hover, so a tap does not
      leave a card stuck in its hover state.
@@ -165,6 +217,9 @@
 </header>
 
 <ul>
+  <li><a class="card" href="4x4/">
+    <img class="cover" src="games/4x4/cover.png" alt="4x4" width="800" height="800" data-clip="games/4x4/clip.png">
+  </a></li>
   <li><a class="card" href="freecell/">
     <img class="cover" src="games/freecell/cover.png" alt="Freecell" width="800" height="800" data-clip="games/freecell/clip.png">
   </a></li>

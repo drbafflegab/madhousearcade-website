@@ -5,12 +5,30 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Freecell</title>
 <style>
+  /* ABC Areal, self-hosted as one variable WOFF2 - the same face, the same
+     file and the same licence as the menu, whose
+     `products/website/source/index.html.in` carries the whole argument for
+     all three. It is repeated here rather than shared because this site has
+     no stylesheet of its own on purpose; `cmake/Website.cmake` says why.
+
+     `../areal.woff2`: a game's page is a directory one level below the root
+     the font is copied to, which is the hop this page already makes to reach
+     the player. */
+  @font-face {
+      font-family: "ABC Areal";
+      src: url("../areal.woff2") format("woff2");
+      font-weight: 400 700;
+      font-style: oblique 0deg 12deg;
+      font-display: swap;
+  }
+
   :root { color-scheme: dark; }
 
   body { margin: 0; min-height: 100vh;
          display: flex; align-items: center; justify-content: center;
          background-color: #08080e; color: #6a6a80;
-         font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+         font: 13px/1.6 "ABC Areal", Arial, Helvetica, sans-serif;
+         font-variation-settings: "DRKM" 1; }
 
   a { color: #e0a33c; }
 </style>

@@ -27,16 +27,43 @@
 // never returns wedges a RENDERER. `docs/archived/render-worker-plan.md` argues
 // the trade and holds every figure.
 //
-// THE CLOCK IS THE DISPLAY'S. This worker asks for its own animation frames and
-// runs `Clock` on the timestamp it is given, so there is nothing to estimate and
-// no model to be wrong - the page used to post its timestamps here and a
-// phase-locked timer used to guess at where the next one would fall, and
-// `player.js`'s clock comment carries both and why neither is left. The display
-// is not the simulation's rate: `docs/runs/drawing-worker-run.md` read one panel
-// at 120 Hz and at 60, so a callback steps whatever the accumulator says, which
-// is often no step at all. It is still asked for HERE rather than on the thread
-// that draws, because the clock belongs to the run and the renderer holds no
-// loop of its own.
+// THE CLOCK IS THE DISPLAY'S AND THE DISPLAY IS READ ON THE PAGE. The page's own
+// animation frame posts its timestamp here as a `tick`, and this thread runs
+// `Clock` on the number it is handed - so there is still nothing to estimate and
+// no model to be wrong, and this thread asks the browser for nothing at all. It
+// used to ask for its own animation frames, on a reading that a worker's
+// callback IS the vsync. That reading was Chrome's: a Safari worker's callbacks
+// are scattered across the refresh period at a circular concentration of 0.147
+// against a uniform null of 0.097, where Chrome's worker reads 0.985, so the
+// thread that stepped was reading a clock that was not the display's however
+// close its RATE came. `docs/runs/frame-cadence-run.md` section 8 is the phase
+// reading, section 16 is what it looks like, and section 19 is why `step` stayed
+// on this thread rather than following the clock to the page. A page's callback
+// is the display's in both browsers, and the page is the only thread on which
+// that is known to be true.
+//
+// SO THE TIMESTAMP ARRIVES ALREADY ON THE PAGE'S ZERO, and this thread must not
+// move it. That zero is the one the input queue is stamped in - every event
+// carries the browser's own `event.timeStamp` and `Clock` drains the queue up to
+// the boundary its timestamps put it at - and a dedicated worker's time origin
+// is its own creation rather than the document's, so a clock run on this
+// thread's zero held every press for however long the page took to fetch a
+// module. Measured on the shipped page before that was fixed: press to the
+// record's arrival read 14.2 ms on one load and 58.5 ms on the next, against
+// 29.5 for the page that posted its own timestamps. This file used to subtract
+// the two origins for exactly that and no longer has either number to subtract;
+// a subtraction here now would move a page timestamp twice.
+//
+// The display is not the simulation's rate: `docs/runs/drawing-worker-run.md`
+// read one panel at 120 Hz and at 60, so a tick steps whatever the accumulator
+// says, which is often no step at all.
+//
+// THE INPUT QUEUE CAN BE REPLACED BY A FILE, once, behind `replay` in the open
+// message: the presentation probe plays a committed recording rather than a
+// hand, so that the reading it takes off a screen is taken over the same input
+// every time. The driver is the block below `frame`, it is reachable from no
+// page that did not say `?probe=present`, and `docs/presentation-probe.md` is
+// what it is for.
 //
 // A classic worker rather than a module one, for the reason `task.worker.js` is:
 // `importScripts` needs no MIME rules on somebody's static host, and the file it
@@ -78,18 +105,17 @@ let session = null;
 let input = null;
 let clock = null;
 
-// What each consumer has been handed, by task id - `freshDeliveries`'s own
-// bookkeeping, held here because release is a consumer's own and local.
+// What each consumer has been handed, by resource id - `publishResources`'s own
+// bookkeeping, held here because what a consumer holds is its own.
 //
-// ONE MAP PER CONSUMER, and there are two: the speaker and the renderer hold
-// separate copies of a block at the same address in separate memories, so a
-// delivery is owed to each of them separately and neither map may answer for
-// the other. What that costs is one copy of a block per consumer, once, on the
-// frame the block first appears - which is what `bytesAt` was already making
-// for the one consumer this file had.
+// ONE SET PER CONSUMER, and there are two: the speaker and the renderer hold
+// separate copies of a resource at the same address in separate memories, and
+// each is handed only the resources its own call may lock - the speaker the
+// ones scoped for `render_audio`, the renderer the ones scoped for
+// `render_video` - so neither set may answer for the other.
 
-let heldByAudio = new Map ();
-let heldByScreen = new Map ();
+let heldByAudio = new Set ();
+let heldByScreen = new Set ();
 
 // How much of each replay log the page has already been told about. The same
 // bookkeeping as the two maps above and for the same reason: the page keeps a
@@ -157,39 +183,16 @@ let audio = [];
 // ZERO IS ALSO REFUSED BY IT, and that is deliberate rather than incidental.
 // `Clock.advance` spells "no previous timestamp" as a falsy `last`, so a clock
 // handed zero primes twice and loses a tick - `products/web-player/tests/loop.js`
-// says so where it chooses its own origin. An animation frame's timestamp is
-// never zero by the time a module has been fetched; the fallback timer's reading
-// could be, and this is where that difference stops.
+// says so where it chooses its own origin.
+//
+// WHAT IT GUARDS AGAINST HAS MOVED AND THE GUARD HAS NOT. It used to stop the
+// fallback timer's own first reading, and there is no timer on this thread any
+// more: every timestamp this file sees arrives on a `tick` the host posted. A
+// browser's animation-frame timestamp is never zero by the time a module has
+// been fetched, so the shipped page cannot reach this line; what can is a HOST
+// that chose its own origin, which is why all four node harnesses start at 1000.
 
 let advanced = 0;
-
-// How far this thread's clock has to be moved to be the PAGE's clock, in
-// milliseconds, and it is a subtraction rather than a model.
-//
-// A dedicated worker's time origin is its own creation and not the document's,
-// so `performance.now ()` here and `performance.now ()` there are the same unit
-// and not the same zero - and an animation-frame callback on this thread is
-// handed a timestamp on THIS thread's zero, which was measured for this
-// milestone rather than recalled: a worker's `requestAnimationFrame` argument
-// sat 0.3 ms from its own `performance.now ()` over 30 frames in Chrome 152,
-// with the two origins 31.2 ms apart.
-//
-// That gap is not academic. Every input event is stamped with the browser's own
-// `event.timeStamp`, which is on the PAGE's zero, and `Clock` drains the input
-// queue up to the boundary its own timestamps put it at - so a clock run on this
-// thread's zero would hold every press for exactly the interval between the
-// document being created and this worker being started, which is however long
-// the page took to fetch a module. Measured on the shipped page before this was
-// fixed: press to the record's arrival read 14.2 ms on one load and 58.5 ms on
-// the next, against 29.5 for the page that posted its own timestamps.
-//
-// `performance.timeOrigin` is the absolute instant each zero stands at, so the
-// difference of the two is exact and is taken once, at `open`. Zero for a host
-// that names none - `products/web-player/tests/plays.js` and `watchdog.js` drive
-// this thread on timestamps they choose for both halves, and there is one clock
-// there to be on.
-
-let originShift = 0;
 
 // The renderer's end of the second channel the page made, or null on a host
 // that brokered none - a harness driving this thread for something other than
@@ -209,8 +212,8 @@ let originShift = 0;
 
 let screenPort = null;
 
-// What the tick owes the speaker, down the page's channel: every block the
-// worklet has not been handed, and then one message per step the tick ran.
+// What the tick owes the speaker, down the page's channel: one message per step
+// the tick ran, each carrying the store as that step left it.
 //
 // ONE MESSAGE PER STEP, which is exactly the shape the page posted when it was
 // the one forwarding samples: a silent step is a message with no bytes on it and
@@ -232,15 +235,21 @@ let screenPort = null;
 // its own: `games/suika`'s state block is 5,984 bytes and every game's sound
 // description in the tree is under a hundred.
 
-const soundOf = (session) => ({ audioState: session.audioStateBytes () });
+//
+// AND THE STORE AS THAT STEP LEFT IT, published at the same moment: the rows of
+// the table and the bytes of every resource scoped for `render_audio` the
+// speaker has not been handed. Taken here rather than when the tick is posted,
+// because a speaker renders a step's description against the table as it
+// stood when that description was captured, and a tick of eight steps is eight
+// different tables.
 
-const sound = (deliveries) => {
+const soundOf = (session) => ({
+    audioState: session.audioStateBytes (),
+    ...publishResources (session.publisher (), heldByAudio, CORE.scope.audio),
+});
+
+const sound = () => {
     if (! audioPort) { audio = []; return; }
-
-    for (const region of deliveries) {
-        audioPort.postMessage ({ id: region.id, address: region.address,
-            bytes: region.bytes }, [region.bytes.buffer]);
-    }
 
     for (const tick of audio) {
         if (! tick) { audioPort.postMessage ({ silent: true }); continue; }
@@ -249,24 +258,26 @@ const sound = (deliveries) => {
         // is a shape a reader of this file can see - which is also what
         // `products/web-player/tests/worklet.js`'s seam check reads, field by
         // field, out of this source.
-        audioPort.postMessage ({ audioState: tick.audioState },
-            [tick.audioState.buffer]);
+        audioPort.postMessage (
+            { audioState: tick.audioState, fresh: tick.fresh, rows: tick.rows },
+            [tick.audioState.buffer,
+                ...tick.fresh.map (resource => resource.bytes.buffer)]);
     }
 
     audio = [];
 };
 
-// What the tick owes the RENDERER, down the page's second channel: every block
-// the render worker has not been handed, and then the one description the
-// picture is a function of.
+// What the tick owes the RENDERER, down the page's second channel: the one
+// description the picture is a function of, and the store as the step that
+// captured it left it - the rows of the table, and the bytes of every resource
+// scoped for `render_video` the render worker has not been handed.
 //
-// THE DELIVERY RULE, which is the speaker's rule one channel over and is the
-// reason the two posts are in this order and in this function rather than at
-// two call sites. A description names a task by ID where a state block carried
-// a pointer, so a description naming an id whose bytes the far side does not
-// hold is a picture drawn out of zeros - plausible, silent, and exactly what
-// `<game>_mirror_<replay>` exists to name. One port delivers in order, so
-// posting the blocks first is the whole of the rule.
+// THE DELIVERY RULE, which is the speaker's rule one channel over. A
+// description names a resource by ID, so a description naming an id whose
+// bytes the far side does not hold is a picture drawn out of zeros -
+// plausible, silent, and exactly what `<game>_mirror_<replay>` exists to name.
+// One message carries all three, so the far side never holds a description
+// without the table it was captured against.
 //
 // ONE MESSAGE PER TICK rather than per step, which is where this differs from
 // the speaker beside it: a skipped 800 samples is a hole and a skipped picture
@@ -279,13 +290,11 @@ const sound = (deliveries) => {
 // thread for something other than its pixels broker no channel, and the guard is
 // what lets them run every other line of this file.
 
-const show = (deliveries) => {
+const show = () => {
     if (! screenPort) { return; }
 
-    for (const region of deliveries) {
-        screenPort.postMessage ({ id: region.id, address: region.address,
-            bytes: region.bytes }, [region.bytes.buffer]);
-    }
+    const { fresh, rows } = publishResources (session.publisher (),
+        heldByScreen, CORE.scope.video);
 
     // Written out rather than composed, for the reason the speaker's tick is:
     // the shape a renderer reads is a shape a reader of this file can see.
@@ -295,8 +304,9 @@ const show = (deliveries) => {
     // run except the pixels it was asked for.
     const videoState = session.videoStateBytes ();
 
-    screenPort.postMessage ({ videoState, frame: session.frameIndex },
-        [videoState.buffer]);
+    screenPort.postMessage ({ videoState, frame: session.frameIndex, fresh,
+        rows }, [videoState.buffer,
+            ...fresh.map (resource => resource.bytes.buffer)]);
 };
 
 // Whether this frame is worth publishing, and then the publishing.
@@ -313,68 +323,30 @@ const show = (deliveries) => {
 const present = (tick) => {
     if (! tick.stepped || tick.held) { return; }
 
-    show (freshDeliveries (session, heldByScreen));
+    show ();
 };
 
-// The display's own frames, asked for from here.
+// One display frame, read on the PAGE: what the clock owes the game, what the
+// game owes the speaker, what it owes the renderer, and the heartbeat the page
+// reads. The `tick` case below is its ONE caller, and nothing on this thread
+// ever reaches it out of a callback of its own - the other producer of a frame
+// message is the `shed { how: 'stepped' }` path, which runs a frame of its own
+// out of band and does not come through here.
 //
-// `requestAnimationFrame` where this worker's global has one, which
-// `docs/runs/drawing-worker-run.md` measured that both browsers the arcade is
-// played in do, and a timer at the frame rate where it does not. The two are not
-// interchangeable and that log says why: an animation frame IS the vsync, so
-// nothing has to estimate where the next one falls, and a hidden tab stops a
-// worker's animation frame dead in Chrome while leaving its timer running at
-// full rate. So the fallback is exactly the case that would run a game nobody is
-// watching at 60 Hz in a background tab, and what stops it is the page's halt on
-// `hidden` arriving below as `prime { running: false }`.
-
-const HAS_ANIMATION_FRAME = typeof requestAnimationFrame === 'function';
-
-// The callback that has been asked for and not yet run - an animation frame id
-// or a timer handle - or null while this worker is not asking for frames.
+// THE CHAIN IS THE PAGE'S AND THIS FUNCTION ARMS NOTHING. It used to ask for the
+// next animation frame on its first line, which is where the page's own loop
+// arms and was kept for the same reason: a step that throws - a game trapping
+// under the sanitizer - leaves the chain intact and reports once a frame, where
+// a re-arm below the throw would take the run down with the first bad frame.
+// The property is kept and there is nothing left here to keep it with.
+// `player.html`'s `loop` arms itself at the top and posts the tick after, so a
+// throw on this thread cannot reach the thing that asks again - and there is no
+// callback in flight for a halt to take back, because a halted page simply
+// stops posting.
 //
-// `running` is the page's permission rather than this thread's state: a halted
-// run asks for nothing, and the two are separate because a callback in flight
-// when a halt arrives has to be taken back rather than waited out.
-
-let pending = null;
-let running = false;
-
-const ask = () => {
-    if (! running || ! session) { return; }
-
-    pending = HAS_ANIMATION_FRAME
-        ? requestAnimationFrame (frame)
-        : setTimeout (() => frame (performance.now ()), 1000 / FRAME_RATE);
-
-};
-
-const startAsking = () => {
-    if (running) { return; }
-
-    running = true;
-
-    ask ();
-};
-
-const stopAsking = () => {
-    running = false;
-
-    if (pending === null) { return; }
-
-    if (HAS_ANIMATION_FRAME) { cancelAnimationFrame (pending); }
-    else { clearTimeout (pending); }
-
-    pending = null;
-};
-
-// One display frame: what the clock owes the game, what the game owes the
-// speaker, what it owes the renderer, and the heartbeat the page reads.
-//
-// ARMED AT THE TOP, which is where the page's own loop arms and is kept for the
-// same reason: a step that throws - a game trapping under the sanitizer - leaves
-// the chain intact and reports once a frame, where a re-arm below the throw
-// would take the run down with the first bad frame.
+// THE TIMESTAMP IS THE PAGE'S OWN, untouched: the clock the input queue is
+// stamped in and the clock a boundary means something in. The header says what
+// this thread used to do to it and why it must not any more.
 //
 // THE FRAME MESSAGE IS A HEARTBEAT AND CARRIES NO PICTURE. What is left on it is
 // what only the page can act on: the frame count and the four logs' new entries,
@@ -384,18 +356,10 @@ const stopAsking = () => {
 // a closing tab needs and cannot ask for. The state block and the deliveries
 // were the page consumer's and there is no page consumer.
 
-const frame = (moment) => {
-    pending = null;
-
-    ask ();
-
+const frame = (now) => {
     if (! session) { return; }
 
     audio = [];
-
-    // On the page's clock from here down, because that is the clock the input
-    // queue is stamped in and the clock a boundary means something in.
-    const now = moment + originShift;
 
     // A timestamp for an instant already spent is answered rather than dropped,
     // because the page reads a frame message as the heartbeat that says this
@@ -404,22 +368,42 @@ const frame = (moment) => {
         ? (advanced = now, clock.advance (now))
         : { stepped: 0, held: true, idle: false, asked: false };
 
-    // The speaker first, and then the renderer. Each is posted every block it
-    // has not been handed before any description that can name one -
+    // The speaker first, and then the renderer. Each message carries the
+    // resources it may need beside the description that can name them -
     // `docs/archived/threaded-host-plan.md`'s *Delivery*, kept once per
     // consumer because each holds its own copies - and the two channels are
     // independent, so the order between them is this file's convenience rather
     // than a rule.
-    sound (tick.stepped ? freshDeliveries (session, heldByAudio) : []);
+    sound ();
 
     present (tick);
+
+    // The recording has run out, said once and to the page alone. Nothing here
+    // stops on it: a run that has played its last recorded frame goes on
+    // stepping with the input it was left holding, which is what keeps a
+    // picture on the screen while the probe's report is read off it.
+    if (replay && ! replay.done && replay.frames !== null
+        && session.frameIndex >= replay.frames)
+    {
+        replay.done = true;
+
+        self.postMessage ({ kind: 'replayed', frame: session.frameIndex });
+    }
 
     self.postMessage ({
         kind: 'frame',
         frame: session.frameIndex,
         stepped: tick.stepped,
         held: tick.held,
-        idle: tick.idle,
+
+        // A REPLAYED RUN IS NEVER IDLE, and that is the driver below answering
+        // the page's halt rather than a claim about the game. `game_report_idle`
+        // means nothing more is coming until something happens to the game, and
+        // on a replayed run something is: the next recorded frame. The page
+        // would otherwise stop asking for frames the instant a recording paused
+        // over a still board, and the probe would be reading a screen nobody was
+        // drawing to.
+        idle: replay ? false : tick.idle,
 
         // What this run would keep if the page went away now, rendered on the
         // frames the game asked for one with `game_report_save` and on no
@@ -443,6 +427,188 @@ const frame = (moment) => {
     });
 };
 
+// ---------------------------------------------------------------------------
+// A RECORDING PLAYED INSTEAD OF THE MOUSE, which is the presentation probe's
+// half of this thread and is reachable from nowhere else.
+//
+// `docs/presentation-probe.md` is what it exists for. The question that probe
+// asks - did a frame that was drawn reach the screen - is answered by comparing
+// the instant the page committed a picture against what a screen capture
+// decodes off the screen, and an answer is only worth having if the input was
+// the same both times. A hand is not the same twice; a committed recording is.
+// So the page fetches the file named by `?replay=<path>` behind
+// `?probe=present`, hands its text over in `open`, and this plays it.
+//
+// WHAT THE FILE OVERRIDES. `seed`, `arg` and `save` are the run's header, so
+// they outrank what the page composed out of its address bar and read out of
+// its store - a recording carries what was DELIVERED rather than a reference to
+// where it came from, which is what lets one play on any machine. The `input`,
+// `tap` and `pointer` lines are change logs, and they drive `Input` at each
+// frame exactly as `goldenhash.js`'s own frame reader does: the held set is the
+// last `input` line at or before the frame, an edge is a button newly held or
+// tapped, and the pointer is the last `pointer` line, `away` being absence and
+// `nohover` a pointer that is there without hovering.
+//
+// IT IS THE RECORDER'S INVERSE, and that is a claim rather than a hope:
+// `web_player_replays_a_recording_it_recorded` plays a committed recording
+// through this driver under node and compares the `input`, `tap` and `pointer`
+// entries the session writes back with the file's own lines. A driver that
+// applied a press a frame late would be a probe measuring a run nobody
+// recorded, and nothing about a picture on a screen would show it.
+//
+// THE PAGE'S HALTS ARE ANSWERED AS IF NOTHING HAPPENED, which is right for a
+// probe and wrong for a player. A replayed run reads no queue, so the pointer
+// leaving the canvas takes nothing from it and a `shed` steps nothing; and
+// `idle` is masked out of the frame message above, because a page that stopped
+// asking for frames would leave the capture reading a screen nothing draws to.
+// That is why this exists behind `replay` alone and why `player.html` composes
+// that field from the probe's own query and from nothing else.
+// ---------------------------------------------------------------------------
+
+let replay = null;
+
+// `arg` keeps its value's interior spaces and cannot begin with one, which is
+// the grammar `Game_Arg` states and the one line here that a split on
+// whitespace would quietly rewrite. Read off the format the way `goldenhash.js`
+// reads it rather than checked against it.
+
+const ARG_LINE = /^arg\s+(\S+)(?:\s+([\s\S]*))?$/;
+
+const parseReplay = (text) => {
+    const file = { seed: null, args: [], save: null, frames: null,
+        inputs: [], taps: [], moves: [], done: false };
+
+    for (const raw of text.split (/\r?\n/)) {
+        const line = raw.trim ();
+
+        if (! line || line.startsWith ('#')) { continue; }
+
+        const [key, ...rest] = line.split (/\s+/);
+
+        if (key === 'seed') { file.seed = Number (rest [0]); }
+        else if (key === 'save') { file.save = rest [0] || ''; }
+        else if (key === 'frame') { file.frames = Number (rest [0]); }
+        else if (key === 'input') {
+            file.inputs.push ({ frame: Number (rest [0]),
+                names: rest.slice (1) });
+        }
+        else if (key === 'tap') {
+            file.taps.push ({ frame: Number (rest [0]),
+                names: rest.slice (1) });
+        }
+        else if (key === 'pointer') {
+            const frame = Number (rest [0]);
+
+            file.moves.push (rest [1] === 'away'
+                ? { frame, x: 0, y: 0, present: false, hovers: true }
+                : { frame, x: Number (rest [1]), y: Number (rest [2]),
+                    present: true, hovers: rest [3] !== 'nohover' });
+        }
+        else if (key === 'arg') {
+            const written = line.match (ARG_LINE);
+
+            if (written) {
+                file.args.push ({ name: written [1],
+                    value: written [2] === undefined ? '' : written [2] });
+            }
+        }
+    }
+
+    return file;
+};
+
+// The `save` line's hex, back into the blob the run was constructed from.
+// `Session` holds it to `save_size` and answers zeros for anything else, so a
+// line this cannot read is a fresh run rather than a refusal - which is the
+// same ladder `SaveStore` on the page climbs for a defective store.
+
+const hexBytes = (hex) => {
+    const bytes = new Uint8Array (Math.floor (hex.length / 2));
+
+    for (let index = 0; index < bytes.length; index++) {
+        bytes [index] = parseInt (hex.slice (index * 2, index * 2 + 2), 16);
+    }
+
+    return bytes;
+};
+
+// The queue, replaced by the file. Every method `Clock` and the halts above
+// reach for is answered here, so nothing outside this function knows which of
+// the two is driving - which is what keeps the shipped loop the loop the probe
+// measures.
+//
+// `applyUpTo` is handed a BOUNDARY by the clock and reads the FRAME instead,
+// and that is the whole of the difference between the two drivers: a queue is
+// drained by wall-clock time because that is when a hand moved, and a recording
+// is indexed by frame because that is what it wrote down. `frameOf` answers with
+// the frame the step about to run will be recorded under - `Session.advance`
+// counts the frame after the step rather than before it - so a line at frame N
+// is applied to the step that becomes frame N.
+
+const scriptInput = (target, file, frameOf) => {
+    let held = new Set (), previous = new Set ();
+    let pointer = { x: 0, y: 0, present: false, hovers: true };
+    let heldAt = 0, tapAt = 0, moveAt = 0;
+
+    target.applyUpTo = () => {
+        const frame = frameOf ();
+
+        while (heldAt < file.inputs.length
+            && file.inputs [heldAt].frame === frame)
+        {
+            held = new Set (file.inputs [heldAt++].names);
+        }
+
+        let tapped = new Set ();
+
+        while (tapAt < file.taps.length && file.taps [tapAt].frame === frame) {
+            tapped = new Set (file.taps [tapAt++].names);
+        }
+
+        while (moveAt < file.moves.length
+            && file.moves [moveAt].frame === frame)
+        {
+            pointer = file.moves [moveAt++];
+        }
+
+        // An edge is a button newly held or one tapped inside the frame, which
+        // is the reader's rule rather than this file's: the held log cannot
+        // express a press and a release inside one frame, so the `tap` log
+        // carries exactly those and both readers of the format derive the rest.
+        for (const button of RECORDED_BUTTONS) {
+            const down = held.has (button);
+
+            target.buttons [button] = down;
+            target.edges [button] = (down && ! previous.has (button))
+                || tapped.has (button);
+        }
+
+        previous = held;
+
+        target.pointer = { x: pointer.x, y: pointer.y,
+            present: pointer.present, hovers: pointer.hovers };
+        target.live = target.pointer;
+    };
+
+    // And everything else a host may do to a queue, answered with what a
+    // recording means by it. The edges are cleared after each step exactly as
+    // they are for a hand, because the next `applyUpTo` sets them again; a
+    // release takes nothing, because there is nothing held that the file did
+    // not put there; an event cannot be queued, because the page sends none on
+    // a run it is not driving; and nothing is ever waiting, because the next
+    // frame is already written down.
+    target.clearEdges = () => {
+        for (const button of RECORDED_BUTTONS) { target.edges [button] = false; }
+    };
+
+    target.releaseButtons = () => {};
+    target.releasePointer = () => {};
+    target.queue = () => false;
+    target.queuePointer = () => false;
+    target.queuePointerButton = () => false;
+    target.waiting = () => false;
+};
+
 self.onmessage = (event) => {
     const message = event.data;
 
@@ -459,13 +625,24 @@ self.onmessage = (event) => {
         // thread. What arrives is the blob the page read for this game, and the
         // shim below is what hands it to `Session` at the one moment a session
         // asks - after `save_size` is known and before `construct` runs.
-        //
-        // Which zero the page's timestamps stand on, so that this thread's own
-        // may be moved onto it. Absent from a host that drives both clocks
-        // itself, and then the shift is zero and nothing moves.
-        if (message.pageTimeOrigin) {
-            originShift = performance.timeOrigin - message.pageTimeOrigin;
-        }
+
+        // The recording this run plays instead of the mouse, or null on every
+        // run that is not a probe's. Parsed before the session is built,
+        // because its header is what the session is built FROM.
+        replay = message.replay ? parseReplay (message.replay) : null;
+
+        // And the blob it was constructed from, which REPLACES the one the page
+        // read out of its store rather than being preferred to it. A recording
+        // carries what was delivered rather than a reference to where it came
+        // from, and an absent `save` line is the format's own spelling for
+        // zeros - `Session.saveLines` writes one only where the delivered blob
+        // had a non-zero byte - so a recording with no line has to construct
+        // from zeros here too. Falling back on the page's store instead would
+        // make a replay of a bare recording depend on whatever this browser
+        // happened to be holding for this game, which is the one thing a
+        // recording exists to be independent of.
+        const saved = ! replay ? message.saved
+            : (replay.save !== null ? hexBytes (replay.save) : null);
 
         // A blob of the wrong length is a store this module has outgrown, and
         // the answer is the one `SaveStore` gives: `save_size` zeros, which is
@@ -473,17 +650,33 @@ self.onmessage = (event) => {
         // could not be answered if it were - the store is the page's, and what
         // reaches it is the blob this thread renders and posts.
         const store = {
-            read: (name, size) => message.saved && message.saved.length === size
-                ? new Uint8Array (message.saved)
+            read: (name, size) => saved && saved.length === size
+                ? new Uint8Array (saved)
                 : new Uint8Array (size),
             write: () => {},
         };
 
         session = new Session (message.bytes, message.trampoline,
-            new HostCore (message.core), message.seed, message.args,
+            new HostCore (message.core),
+            replay && replay.seed !== null ? replay.seed : message.seed,
+            replay ? replay.args : message.args,
             message.workerUrl, message.resources, store);
 
         input = new Input ();
+
+        // And the queue, replaced by the file where there is one. Said out loud
+        // on the one message this thread sends that is neither a frame nor an
+        // answer, because a probe run that silently played the wrong recording
+        // - or none - would be a reading nobody could tell from a good one, and
+        // the page has no console of its own in front of the person taking it.
+        if (replay) {
+            scriptInput (input, replay, () => session.frameIndex);
+
+            self.postMessage ({ kind: 'note', text: `replaying `
+                + `${replay.frames} frames at seed ${replay.seed}: `
+                + `${replay.inputs.length} input lines, ${replay.taps.length} `
+                + `taps, ${replay.moves.length} pointer lines` });
+        }
 
         // A task becoming ready under a game whose state had no other reason to
         // move, which is the half of ending `game_report_idle` the player cannot
@@ -546,16 +739,34 @@ self.onmessage = (event) => {
             save: session.renderSave (),
         });
 
-        // And the display, asked for its frames - unless the page says it is
-        // already halted, which a tab opened into the background is. The default
-        // is to run, because a host that says nothing about halting has no halt
-        // table: `products/web-player/tests/plays.js` and `watchdog.js` both
-        // drive this thread through a shimmed animation frame and neither has
-        // one.
-        if (message.running !== false) { startAsking (); }
-
         break;
     }
+
+    // ONE DISPLAY FRAME, READ ON THE PAGE AND POSTED HERE. `player.html`'s
+    // `loop` arms itself, posts this with the timestamp its own animation frame
+    // was handed, and does its two watchdog reads after; everything from `frame`
+    // down is this thread's.
+    //
+    // THIS IS THE WHOLE OF WHAT MAKES THE GAME MOVE, so there is no permission
+    // to keep beside it. A halted run - a pause, a hidden tab, a game that
+    // reported itself idle, a tab opened into the background that was never
+    // unhalted - is a page whose loop is not armed and which therefore posts
+    // nothing, and that is one mechanism rather than two. It used to be two:
+    // this thread asked the display for its own frames and the page sent a
+    // separate `running` flag to stop it, and a flag that can only ever agree
+    // with the absence of the message it gates is a flag that rots.
+    //
+    // `session` is the only guard and it is the one that matters. `open` is
+    // posted before a first tick can be - the page builds the worker, posts
+    // `open` and only then arms its loop, and messages are delivered in order -
+    // and `close` nulls the session, so a tick either side of a run steps
+    // nothing rather than trapping.
+    case 'tick':
+        if (! session) { break; }
+
+        frame (message.time);
+
+        break;
 
     // Who is listening: the worklet's end of a `MessageChannel` the page made,
     // or NULL for a page whose worklet never arrived.
@@ -597,14 +808,14 @@ self.onmessage = (event) => {
         // message twice in a run's life: once at `reset`, into a map that is
         // already empty, and once when it has replaced a wedged renderer with a
         // fresh worker on a fresh linear memory. That second instance holds no
-        // task block at all, so a record of what the DEAD one had been handed
-        // would keep every live block from ever being delivered again and leave
-        // the new renderer drawing pictures out of zeros - silently, on the
-        // first frame a description named a task. Cleared here rather than
+        // resource at all, so a record of what the DEAD one had been handed
+        // would keep every live resource from ever being published again and
+        // leave the new renderer drawing pictures out of zeros - silently, on
+        // the first frame a description named one. Cleared here rather than
         // asked for, because the page cannot tell this thread what another
         // thread's memory holds and does not have to: a new port is a new
         // consumer by construction.
-        heldByScreen = new Map ();
+        heldByScreen = new Set ();
 
         break;
 
@@ -640,6 +851,21 @@ self.onmessage = (event) => {
     // the sound off until that answer has been published and played.
     case 'shed': {
         if (! session) { break; }
+
+        // A REPLAYED RUN SHEDS NOTHING, because it holds nothing the browser
+        // put there: the pointer leaving the canvas is a fact about a hand, and
+        // this run's pointer is a line in a file. The page is still owed its
+        // answer - it holds the sound off until one lands - so a `stepped` shed
+        // is answered with a frame that stepped nothing.
+        if (replay) {
+            if (message.how === 'stepped') {
+                self.postMessage ({ kind: 'frame', frame: session.frameIndex,
+                    stepped: 0, held: true, idle: false, pointerAway: true,
+                    save: null, records: freshRecords () });
+            }
+
+            break;
+        }
 
         if (message.how === 'quiet') {
             input.applyUpTo (Infinity);
@@ -684,7 +910,7 @@ self.onmessage = (event) => {
                     || report & REPORT.silent ? null : soundOf (session));
             }
 
-            sound (moves ? freshDeliveries (session, heldByAudio) : []);
+            sound ();
 
             const still = (report & REPORT.still) !== 0;
 
@@ -726,24 +952,28 @@ self.onmessage = (event) => {
 
         break;
 
-    // The interval that has not been lived through, forgotten, and whether this
-    // thread may go on asking the display for frames.
+    // The interval that has not been lived through, forgotten.
     //
     // The page arms this wherever it would have primed the clock itself -
-    // entering or leaving a pause, a hidden tab, a rest - and both halves matter.
-    // The clock is primed because an animation frame that arrives after a stall
-    // carries every second of it, and the accumulator would spend that on a
-    // catch-up of up to eight steps nobody played. And `running` is the halt
-    // itself: a page that has stopped watching stops this thread asking, which
-    // is what keeps a hidden tab from running a game at whatever rate the
-    // browser leaves the worker's clock at.
+    // entering or leaving a pause, a hidden tab, a rest - because an animation
+    // frame that arrives after a stall carries every second of it, and the
+    // accumulator would spend that on a catch-up of up to eight steps nobody
+    // played. Sent on the way into a halt as well as on the way out, and the two
+    // are now one message: what used to tell them apart was the flag below, and
+    // priming a clock that is about to stop costs a subtraction and saves a
+    // branch.
+    //
+    // IT NO LONGER CARRIES THE HALT. It used to say whether this thread might go
+    // on asking the display for frames, and that flag WAS the halt; the display
+    // is read on the page now, so a halted page stops posting `tick` and there
+    // is nothing here left to stop. What a hidden tab would otherwise cost is
+    // unchanged and is still refused on the page - `docs/runs/drawing-worker-run.md`
+    // (b) measured a hidden tab's worker keeping a timer at full rate in Chrome
+    // and both clocks at about nine ticks a second in Safari.
     case 'prime':
         if (clock) { clock.prime (); }
 
         advanced = 0;
-
-        if (message.running) { startAsking (); }
-        else { stopAsking (); }
 
         break;
 
@@ -765,10 +995,12 @@ self.onmessage = (event) => {
                 seed: session.seed,
                 frameIndex: session.frameIndex,
                 stateSize: session.stateSize,
-                taskMax: session.taskMax,
+                maxTaskCount: session.maxTaskCount,
+                maxResourceCount: session.maxResourceCount,
                 saveSize: session.saveSize,
                 readLog: session.readLog,
                 taskTable: session.taskTable (),
+                resourceTable: session.resourceTable (),
             },
         });
 
@@ -777,8 +1009,6 @@ self.onmessage = (event) => {
     // Every thread this session is still holding, ended. A body running for a
     // game that no longer exists is a core spent on an answer nothing will read.
     case 'close':
-        stopAsking ();
-
         if (session) { session.runner.stop (); }
 
         session = null;

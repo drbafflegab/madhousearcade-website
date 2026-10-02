@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Minesweeper</title>
+<title>4x4</title>
 <style>
   /* ABC Areal, self-hosted as one variable WOFF2 - the same face, the same
      file and the same licence as the menu, whose
@@ -50,13 +50,13 @@ const carried = segments.filter ((segment) => {
     return key !== "module" && key !== "resources";
 });
 
-const query = ["module=games/minesweeper/minesweeper.wasm"]
+const query = ["module=games/4x4/4x4.wasm"]
     .concat (carried).join ("&");
 
 location.replace ("../player.html?" + query);
 </script>
 </head>
 <body>
-<a href="../player.html?module=games/minesweeper/minesweeper.wasm">play Minesweeper</a>
+<a href="../player.html?module=games/4x4/4x4.wasm">play 4x4</a>
 </body>
 </html>

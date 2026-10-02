@@ -5,7 +5,7 @@
 // browser. Anything that touches `document`, a canvas, an `AudioContext` or
 // `requestAnimationFrame` is in the page; nothing else is. What is left here is
 // the whole of what a host has to get right about a game - the struct offsets,
-// the two records it hands a game and the trampoline that makes them callable,
+// the three records it hands a game and the trampoline that makes them callable,
 // the answer protocol, the input queue, the clock that decides how many steps
 // an interval owes and the palette - and it lives in a file of its own so that
 // it can be run without a browser at all.
@@ -16,9 +16,10 @@
 // THERE ARE TWO SIDES OF THE GAME IN HERE NOW, and the line between them is a
 // thread rather than a browser. `Session` is the SIMULATION - it constructs,
 // steps, runs the tasks and records - and `Consumer` is what renders somewhere
-// else: a second instance of the same module, handed the state block and each
-// task block at their own addresses, on which the game's own `render_video`,
-// `render_audio` and `save` are called and `construct` and `step` never are.
+// else: a second instance of the same module, handed a description and the
+// resources its scope names at their own addresses, on which the game's own
+// `render_video` and `render_audio` are called and `construct` and `step` never
+// are.
 // `sim.worker.js` holds the first and the page holds the second, and both are
 // this file's because a consumer needs no browser either.
 //
@@ -46,7 +47,7 @@
 // ---------------------------------------------------------------------------
 
 const LAYOUT = {
-    // `taskMax` is the newest member and `bytes` moved 52 to 56 with it, which
+    // `maxTaskCount` is the newest member and `bytes` moved 52 to 56 with it, which
     // is the whole toll a tail addition charges this mirror: no offset above it
     // moved, on either target. Verified against the built modules rather than
     // read off the header - `factory` writes 2 at offset 52 of
@@ -56,7 +57,7 @@ const LAYOUT = {
     // A mirror that FORGOT this member reads 0, and 0 is the legal declaration
     // meaning *this game spawns nothing* - so the page would refuse every spawn
     // a working game makes. That is why `web_player_plays`'s identity check has
-    // `task_max` as its sixth field and why `games/example` declares a non-zero
+    // `max_task_count` as its sixth field and why `games/example` declares a non-zero
     // one, exactly as `games/pong` declares a non-zero `background`.
     //
     // ARGUMENTS MOVED NOTHING HERE, and that is the thing to know about them at
@@ -68,7 +69,7 @@ const LAYOUT = {
     // ARITY, which no offset in this block can see and which the arity check
     // further down is the whole reader of.
     // SAVE STATE moved two members in, at the tail again, and `bytes` went 56
-    // to 64. `saveSize` is read for the same reason `taskMax` is - a mirror one
+    // to 64. `saveSize` is read for the same reason `maxTaskCount` is - a mirror one
     // field short reads 0, which is the legal declaration meaning *this game
     // persists nothing*, so a saving game would be constructed from null with
     // every other check green.
@@ -85,11 +86,38 @@ const LAYOUT = {
     // the four that follow moved down with it - which is the one edit a tail
     // rule cannot spare a hand-written mirror, and the reason every figure here
     // was taken from the header's own assert rather than counted.
+    //
+    // `maxResourceCount` is the tail again, and `bytes` went 80 to 84 with it. A
+    // mirror one field short reads 0, which is the legal declaration of no
+    // resources at all, so every loading task would fail at its commit with
+    // every other check green.
+    //
+    // `maxScratchBytes` is the tail once more, and `bytes` went 84 to 88. A
+    // mirror one field short reads 0, the legal declaration that no body of
+    // this game asks for scratch, so every spawn of a body that does would end
+    // the run instead of running. The NATIVE `sizeof` did not move for it - the
+    // member landed in tail padding the pointers were already paying for -
+    // which is why the figures here are the header's wasm32 half rather than a
+    // reading of either build.
+    //
+    // THE THREE RESOURCE BYTE FIGURES are the tail after that, and `bytes` went
+    // 88 to 100. A mirror short of them reads 0 for each, the legal declaration
+    // that this game holds no bytes in that scope, so every loading task would
+    // fail at its commit - by the byte rule rather than by the count, which is
+    // the same silence in a different sentence.
+    //
+    // THE FRAME'S PAIR is the tail after those, and `bytes` went 100 to 108. A
+    // mirror short of both reads 0 for each, the console's own frame, which is
+    // the silence once more; one short of `frameHeight` alone reads half a
+    // declaration and this page refuses it at load.
     game: { size: 0, name: 4, version: 8, palette: 20, construct: 24,
             step: 28, renderVideo: 32, renderAudio: 36, controls: 40,
-            background: 48, taskMax: 52, saveSize: 56, save: 60,
+            background: 48, maxTaskCount: 52, saveSize: 56, save: 60,
             videoStateSize: 64, audioStateSize: 68, captureVideo: 72,
-            captureAudio: 76, bytes: 80 },
+            captureAudio: 76, maxResourceCount: 80, maxScratchBytes: 84,
+            maxGameResourceBytes: 88, maxVideoResourceBytes: 92,
+            maxAudioResourceBytes: 96, frameWidth: 100, frameHeight: 104,
+            bytes: 108 },
 
     // Game_Task, which a game points at when it spawns. Read through the
     // pointer one call hands over rather than walked as an array, like
@@ -100,69 +128,68 @@ const LAYOUT = {
     //     0 | const char * name
     //     4 | Game_Task_Body * body
     //     8 | uint32_t input_size
-    //    12 | uint32_t scratch_size
-    //    16 | uint32_t output_size
+    //    12 | uint32_t output_size
+    //    16 | uint32_t scratch_size
     //       | [sizeof=20, align=4]
-    task: { name: 0, body: 4, inputSize: 8, scratchSize: 12, outputSize: 16,
+    //
+    // `scratchSize` is LAST here and second in the body's parameter list, which
+    // reads input, scratch, output. The header pins both orders in one assert
+    // for exactly this reader: a mirror written off the parameter list would
+    // put `outputSize` at 16 and hand every body the two sizes crossed.
+    task: { name: 0, body: 4, inputSize: 8, outputSize: 12, scratchSize: 16,
             bytes: 20 },
 
     // Game_Task_Runner, the record `construct` and `step` are handed - and one
-    // of the two blocks in this file that this mirror WRITES rather than reads.
+    // of the blocks in this file that this mirror WRITES rather than reads.
     //
     //     0 | void * context
     //     4 | uint32_t (* spawn) (void *, Game_Task const *, void const *)
-    //     8 | _Bool (* done) (void *, uint32_t)
-    //    12 | const void * (* bytes) (void *, uint32_t)
-    //    16 | void (* release) (void *, uint32_t)
-    //       | [sizeof=20, align=4]
+    //     8 | Game_Task_Status (* status) (void *, uint32_t)
+    //    12 | void (* finalize) (void *, uint32_t, void *)
+    //       | [sizeof=16, align=4]
     //
-    // 20 rather than the native 40, because all five members are pointers and
+    // 16 rather than the native 32, because all four members are pointers and
     // a wasm32 pointer is four bytes where a native one is eight. The header's
     // `static_assert` is target-conditional for that reason.
     //
-    // `stride` rather than `bytes` for the record's own size, which every other
-    // block here spells `bytes`: this record HAS a member called `bytes`, and one
-    // key cannot be both. `Game_Task_Result` and its `LAYOUT.result` block went
-    // with the results array - a game asks about a task by id now, so nothing
-    // about an answer crosses this boundary as a struct at all.
-    //
-    // The four function members are TABLE INDICES here rather than addresses. A
-    // game imports nothing, so it reaches a host by `call_indirect` on its own
+    // The three function members are TABLE INDICES here rather than addresses.
+    // A game imports nothing, so it reaches a host by `call_indirect` on its own
     // `__indirect_function_table`, and what goes in these words is where
     // `installTrampoline` put this host's wrappers in that table.
-    runner: { context: 0, spawn: 4, done: 8, bytes: 12, release: 16,
-              stride: 20 },
+    runner: { context: 0, spawn: 4, status: 8, finalize: 12, stride: 16 },
 
     // Game_Resource_Loader, the record a task BODY is handed - written into the
     // body's own instance rather than into the game's, because that is where a
     // body runs and what it can reach.
     //
     //     0 | void * context
-    //     4 | uint32_t (* load) (void *, Game_Resource const *, void *,
-    //       |                    uint32_t)
-    //       | [sizeof=8, align=4]
+    //     4 | uint32_t (* load) (void *, Game_Resource const *, uint32_t)
+    //     8 | void (* unload) (void *, uint32_t)
+    //       | [sizeof=12, align=4]
     //
-    // 8 against the native 16, for the reason above. Two members and not three:
-    // a body reads files and cannot spawn, which `interface/game.h` says with a
-    // parameter list and this mirror says again with a shorter record.
-    loader: { context: 0, load: 4, bytes: 8 },
+    // 12 against the native 24, for the reason above. A body loads and unloads
+    // and cannot spawn, which `interface/game.h` says with a parameter list and
+    // this mirror says again with a shorter record.
+    loader: { context: 0, load: 4, unload: 8, bytes: 12 },
 
-    // Game_Task_Reader, the record every RENDERER is handed - and the third
-    // block in this file this mirror writes rather than reads.
+    // Game_Resource_Store, the record `step` and every RENDERER is handed.
     //
     //     0 | const void * context
-    //     4 | const void * (* bytes) (const void *, uint32_t, uint32_t *)
+    //     4 | Game_Data (* lock) (const void *, uint32_t)
+    //     8 | void (* unlock) (const void *, uint32_t)
+    //       | [sizeof=12, align=4]
+    //
+    // `lock` returns a struct, which wasm32 returns through a hidden first
+    // parameter: the table entry is `(sret, context, id) -> void`, and the host
+    // writes `data` below at `sret` in the memory of the instance that called.
+    store: { context: 0, lock: 4, unlock: 8, bytes: 12 },
+
+    // Game_Data, what a lock answers.
+    //
+    //     0 | const uint8_t * bytes
+    //     4 | uint32_t size
     //       | [sizeof=8, align=4]
-    //
-    // 8 against the native 16, for the reason the loader is 8 against 16. Two
-    // members and not five: a renderer names a task's bytes and can do nothing
-    // else, which `interface/game.h` says with a parameter list and this mirror
-    // says again with a shorter record.
-    //
-    // `stride` rather than `bytes` for the record's own size, for the reason
-    // `runner` above spells it that way: this record HAS a member called
-    // `bytes`, and one key cannot be both.
-    reader: { context: 0, bytes: 4, stride: 8 },
+    data: { bytes: 0, size: 4, stride: 8 },
 
     // Game_Controls, whose members are offsets within it rather than within
     // Game - `game.controls` above says where it starts. Two `Game_Need`s, and
@@ -176,7 +203,7 @@ const LAYOUT = {
     // It sat LAST in Game when it arrived, and that is what this block is
     // evidence of: adding it moved no offset above, so the mirror gained two
     // constants rather than editing eleven. `background` went in after it and
-    // cost exactly the same - one offset and a new `bytes` - and `task_max`
+    // cost exactly the same - one offset and a new `bytes` - and `max_task_count`
     // after that cost the same again, which is why the tail is where Game grows
     // and where the next member goes too.
     //
@@ -194,21 +221,27 @@ const LAYOUT = {
     // everything past them is here because nothing computes it.
     //
     //    12 | Game_Pointer pointer
-    //    12 |   uint8_t x
-    //    13 |   uint8_t y
-    //    14 |   _Bool present
-    //    15 |   Game_Button_State primary       (held 15, edge 16)
-    //    17 |   Game_Button_State secondary     (held 17, edge 18)
-    //    19 |   _Bool hovers
-    //       | [sizeof=20, align=1]
+    //    12 |   int16_t x
+    //    14 |   int16_t y
+    //    16 |   _Bool present
+    //    17 |   Game_Button_State primary       (held 17, edge 18)
+    //    19 |   Game_Button_State secondary     (held 19, edge 20)
+    //    21 |   _Bool hovers
+    //       | [sizeof=22, align=2]
     //
-    // Every member of Game_Input is a byte, so there is no padding in it at all
-    // and the native layout is identical - unlike `event` above, which holds a
-    // pointer and therefore differs between the two targets.
-    pointer: { x: 12, y: 13, present: 14, primary: 15, secondary: 17,
-               hovers: 19 },
+    // The two coordinates are the only members wider than a byte, written
+    // little endian as `int16_t`, and they fall on even offsets with nothing
+    // padded, so the native layout is identical - unlike `event` above, which
+    // holds a pointer and therefore differs between the two targets.
+    pointer: { x: 12, y: 14, present: 16, primary: 17, secondary: 19,
+               hovers: 21 },
 
-    inputBytes: 20,   // 6 buttons { held, edge }, then Game_Pointer
+    inputBytes: 22,   // 6 buttons { held, edge }, then Game_Pointer
+
+    // Game_Video_Frame, whose head is the pair its host resolved and whose
+    // pixels follow at 8 on both targets, which `interface/game.h` pins. A
+    // frame is `pixels` bytes of head and `width * height` of picture.
+    frame: { width: 0, height: 4, pixels: 8 },
 };
 
 // ---------------------------------------------------------------------------
@@ -216,7 +249,7 @@ const LAYOUT = {
 //
 // `products/host-core` is the rulebook every host has to agree on, compiled
 // natively into `inspector` and to `host-core.wasm` for this file - so the task
-// table and the validity of an id, release and residency, argument settling,
+// table and the validity of an id, the resource store, argument settling,
 // descriptor grammar and the ring a runner's context is stamped with are one
 // implementation rather than three. `docs/host-core-rules.md` is the
 // measurement that says which sentences those are and where each one used to
@@ -240,8 +273,8 @@ const LAYOUT = {
 const CORE = {
     // `Host_Core_Figure`, which is how a JavaScript host reads a figure the
     // console reads off an enumerator in the header.
-    figure: { contextRing: 0, argumentMax: 1, argumentNameMax: 2,
-              argumentTextMax: 3, saveMax: 4 },
+    figure: { contextRing: 0, maxArgumentCount: 1, maxArgumentNameBytes: 2,
+              maxArgumentTextBytes: 3, maxSaveBytes: 4 },
 
     // `Host_Core_Context_Check`. `absent` is a slot outside the ring and its
     // construct twin, which is what a non-null context that is not one of this
@@ -253,19 +286,123 @@ const CORE = {
     //     0 | uint32_t id
     //     4 | Host_Core_Spawn_Verdict verdict
     //     8 | uint32_t input_size
-    //       | [sizeof=12, align=4]
+    //    12 | uint32_t scratch_size
+    //    16 | uint32_t max_scratch_bytes
+    //       | [sizeof=20, align=4]
     //
-    // One CONDITION and four bugs. `crowded` is the game already holding every
+    // One CONDITION and five bugs. `crowded` is the game already holding every
     // id it declared, which is answered with the 0 the game acts on; the rest
-    // end the run, and `input_size` is the figure two of their sentences quote.
+    // end the run, and the three sizes are the figures their sentences quote.
+    // `greedy` went in ahead of `full` rather than after it, because these are
+    // an enumeration a mirror reads by value and the order is the header's.
     verdict: { accepted: 0, crowded: 1, bodyless: 2, unfed: 3, overfed: 4,
-               full: 5 },
-    spawn: { id: 0, verdict: 4, inputSize: 8, bytes: 12 },
+               greedy: 5, full: 6 },
+    spawn: { id: 0, verdict: 4, inputSize: 8, scratchSize: 12,
+             maxScratchBytes: 16, bytes: 20 },
 
-    // `Host_Core_Id`, which is the whole of what `done`, `bytes` and `release`
-    // are held to: the table is the oracle, past the counter is an id no spawn
-    // returned, and absent below it is one the game let go.
-    id: { live: 0, none: 1, unissued: 2, released: 3 },
+    // `Host_Core_Ask`, which is the whole of what `status` and `finalize` are
+    // held to: the table is the oracle, past the counter is an id no spawn
+    // returned, and absent below it is one the game finalized.
+    ask: { live: 0, none: 1, unissued: 2, finalized: 3 },
+
+    // `Host_Core_Status`, which is `Game_Task_Status` value for value, and
+    // `Host_Core_Finalize`, the answer a `finalize` arrives in:
+    //
+    //     0 | Host_Core_Ask verdict
+    //     4 | Host_Core_Status status
+    //     8 | uintptr_t block
+    //    12 | uint32_t output_size
+    //       | [sizeof=16, align=4]
+    status: { pending: 0, succeeded: 1, failed: 2 },
+    finalized: { verdict: 0, status: 4, block: 8, outputSize: 12, bytes: 16 },
+
+    // `Host_Core_Scope`, which is `Game_Resource_Scope` bit for bit.
+    scope: { game: 1, video: 2, audio: 4 },
+
+    // `Host_Core_Load_Verdict`, and `Host_Core_Load` beside it:
+    //
+    //     0 | uint32_t id
+    //     4 | Host_Core_Load_Verdict verdict
+    //     8 | uint32_t task
+    //    12 | uint32_t loads
+    //    16 | uint32_t scope
+    //       | [sizeof=20, align=4]
+    load: { taken: 0, unscoped: 1, foreign: 2, late: 3, crowded: 4 },
+    loadAnswer: { id: 0, verdict: 4, task: 8, loads: 12, scope: 16,
+                  bytes: 20 },
+
+    // `Host_Core_Loaded`, one load as an answer carries it:
+    //
+    //     0 | uintptr_t bytes
+    //     4 | size_t span
+    //     8 | uint32_t size
+    //    12 | uint32_t scope
+    //       | [sizeof=16, align=4]
+    loaded: { bytes: 0, span: 4, size: 8, scope: 12, stride: 16 },
+
+    // `Host_Core_Commit_Verdict`, and `Host_Core_Commit` beside it:
+    //
+    //     0 | Host_Core_Commit_Verdict verdict
+    //     4 | uint32_t task
+    //     8 | uint32_t resource
+    //    12 | uint32_t loads
+    //    16 | uint32_t counted
+    //    20 | uint32_t max_resource_count
+    //    24 | uint32_t scope
+    //    28 | uint32_t load_bytes
+    //    32 | uint32_t counted_bytes
+    //    36 | uint32_t max_resource_bytes
+    //       | [sizeof=40, align=4]
+    //
+    // `heavy` went in BETWEEN `crowded` and `dead`, where the header puts it,
+    // so `dead` is 3 here and 2 nowhere: a mirror that kept the old number
+    // would read every byte refusal as the fault that ends the run.
+    commit: { settled: 0, crowded: 1, heavy: 2, dead: 3 },
+    committed: { verdict: 0, task: 4, resource: 8, loads: 12, counted: 16,
+                 maxResourceCount: 20, scope: 24, loadBytes: 28,
+                 countedBytes: 32, maxResourceBytes: 36, bytes: 40 },
+
+    // `Host_Core_Lock_Verdict`, and `Host_Core_Lock` beside it:
+    //
+    //     0 | Host_Core_Lock_Verdict verdict
+    //     4 | uint32_t scope
+    //     8 | uint32_t size
+    //    12 | uintptr_t bytes
+    //       | [sizeof=16, align=4]
+    lock: { taken: 0, dead: 1, unscoped: 2, held: 3 },
+    locked: { verdict: 0, scope: 4, size: 8, bytes: 12, stride: 16 },
+
+    // `Host_Core_Unlock_Verdict`.
+    unlock: { taken: 0, unheld: 1 },
+
+    // `Host_Core_Close_Verdict`, and `Host_Core_Close` beside it:
+    //
+    //     0 | Host_Core_Close_Verdict verdict
+    //     4 | Host_Core_Scope call
+    //     8 | uint32_t holding
+    //    12 | uint32_t lowest
+    //       | [sizeof=16, align=4]
+    close: { balanced: 0, holding: 1 },
+    closed: { verdict: 0, call: 4, holding: 8, lowest: 12, bytes: 16 },
+
+    // `Host_Core_Resource`, one row of the store's table:
+    //
+    //     0 | uint32_t id
+    //     4 | uint32_t scope
+    //     8 | uint32_t size
+    //    12 | uint32_t committed
+    //    16 | uint32_t unloaded
+    //    20 | uint32_t unloader
+    //    24 | uintptr_t bytes
+    //    28 | size_t span
+    //    32 | _Bool dead
+    //    33 | _Bool held
+    //       | [sizeof=36, align=4]
+    //
+    // `bytes` is an address in the GAME's linear memory, exactly as a task
+    // row's `block` is.
+    resourceRow: { id: 0, scope: 4, size: 8, committed: 12, unloaded: 16,
+                   unloader: 20, bytes: 24, span: 28, dead: 32, held: 33 },
 
     // `Host_Core_Arguments_Verdict`, and `Host_Core_Arguments` beside it:
     //
@@ -333,7 +470,8 @@ const CORE = {
     // of them and cannot be: WHERE a body is executing is the embedder's
     // business, so the table says `ready` from the spawn onwards and this file
     // supplies that word from what it knows about its own threads.
-    state: ["ready", "failed", "resident", "empty"],
+    state: ["ready", "abandoned", "succeeded", "failed"],
+    stateOf: { ready: 0, abandoned: 1, succeeded: 2, failed: 3 },
 };
 
 // What the page passes for an array with nothing in it. Null is the count-zero
@@ -346,12 +484,12 @@ const NOTHING = 0;
 // that record was armed for.
 //
 // `interface/game.h` makes `context` the capability: opaque to the game, never
-// examined by it, handed straight back as the first argument of `spawn` and
-// `release`, and validated by the host at every entry. What this host puts
+// examined by it, handed straight back as the first argument of `spawn`,
+// `status` and `finalize`, and validated by the host at every entry. What this host puts
 // there is a number carrying the frame, so the validation `console.c` does by
-// comparing a `Runner_Context`'s `frame` is arithmetic here - a record used a
-// step after the one it was armed for still names that step, and is refused by
-// name.
+// comparing a `Game_Runner_Context`'s `frame` is arithmetic here - a record
+// used a step after the one it was armed for still names that step, and is
+// refused by name.
 //
 // One of these where the console has two halves, because the LOADER's context
 // is minted where a body runs - `runTaskBody` below, in an instance of its own,
@@ -365,28 +503,155 @@ const RUNNER = 0x20000000;
 // context this session's `load` refuses rather than as one it serves.
 const LOADER = 0x10000000;
 
-// And the same for the reader a RENDERER is handed. Distinct from both, so that
-// a record kept out of one call and spent in another arrives as a context the
-// wrong service refuses rather than as one it serves. One value rather than a
-// ring: a renderer is never called inside another, so there is no second reader
-// to tell this one apart from and a flag is the whole of *is this call live*.
-const READER = 0x30000000;
+// And the same for the store `step` is handed, tagged with the ring slot the
+// frame's runner was armed on - so a store a game kept past its `step` names a
+// frame the rulebook's stamps no longer call live, exactly as a kept runner
+// does.
+const STORE = 0x40000000;
+
+// And the store a RENDERER is handed. Distinct from all three, so that a record
+// kept out of one call and spent in another arrives as a context the wrong
+// service refuses rather than as one it serves. One value rather than a ring: a
+// renderer is never called inside another, so there is no second store to tell
+// this one apart from, and the call the instance has open is the whole of *is
+// this call live*.
+const RENDERING = 0x30000000;
 
 // And the record a host with no table of its own hands over, which is a null
 // one. It is the arrangement a `step` gets from a caller with no session behind
 // it, which every game's own tests hand a null runner
-// (`games/pong/tests/a_game_spends_exactly_the_block_it_asked_for.c:155`).
+// (`games/pong/tests/a_game_spends_exactly_the_block_it_asked_for.c:179-182`).
 //
-// A `Consumer` or a worklet processor built WITHOUT a trampoline is that host:
-// there is then no wasm function in its instance's table that a reader's
-// `bytes` could name, so the record it hands over is this. It renders anyway -
-// a description that names no task never asks - and what it cannot do is answer
-// one that does. Handing a trampoline to a consumer is what buys the answer,
-// and it costs one more module compiled in whatever scope the consumer lives
-// in: measured for an `AudioWorkletGlobalScope` in
-// `docs/runs/threaded-host-run.md` (c), where compiling the GAME's bytes
-// synchronously in that scope is already what every run does.
-const NO_READER = 0;
+// A `Consumer` built WITHOUT a trampoline and a rulebook is that host: there is
+// then no wasm function in its instance's table that a store's `lock` could
+// name, so the record it hands over is this. It renders anyway - a description
+// that names no resource never asks - and what it cannot do is answer one that
+// does.
+const NO_STORE = 0;
+
+// The sentences a refusal about a task or a resource is spoken in, one per
+// verdict of `products/host-core`, byte for byte the templates
+// `docs/host-core-rules.md` carries and the console and the golden compose. Free
+// functions rather than methods, because four places speak them - a session, a
+// body's instance, a `Consumer`, and the worklet processor in `player.html`,
+// whose source interpolates these functions' own text.
+
+function callName (call) {
+    if (call === CORE.scope.video) { return "render_video"; }
+    if (call === CORE.scope.audio) { return "render_audio"; }
+
+    return "step";
+}
+
+// And the two words a sentence about a scope's BYTES is spelled with: the scope
+// itself, and the member of `Game` whose figure it was weighed against. The
+// scope is what a reader reads; the member is what they would edit.
+
+function scopeWord (scope) {
+    if (scope === CORE.scope.video) { return "video"; }
+    if (scope === CORE.scope.audio) { return "audio"; }
+
+    return "game";
+}
+
+function scopeMember (scope) {
+    if (scope === CORE.scope.video) { return "max_video_resource_bytes"; }
+    if (scope === CORE.scope.audio) { return "max_audio_resource_bytes"; }
+
+    return "max_game_resource_bytes";
+}
+
+function askRefusal (verdict, id, called, issued) {
+    if (verdict === CORE.ask.none) {
+        return `${called} was called with id 0, which is *no task* rather `
+            + `than a task; a polling site guards on the id it kept`;
+    }
+
+    if (verdict === CORE.ask.unissued) {
+        return `${called} was called with id ${id}, which this run has never `
+            + `issued; ${issued} id(s) have been issued so far`;
+    }
+
+    return `${called} was called with id ${id}, which the game has already `
+        + `finalized; a finalized id names nothing, and finalize pairs with `
+        + `clearing the id it took`;
+}
+
+function loadRefusal (answer) {
+    const task = answer.task;
+
+    if (answer.verdict === CORE.load.unscoped) {
+        return `load in task ${task} was handed scope 0, which names no `
+            + `instance to hold the bytes; a load names the calls that lock it`;
+    }
+
+    if (answer.verdict === CORE.load.foreign) {
+        return `load in task ${task} was handed scope ${answer.scope}, which `
+            + `carries a bit naming no call; a load names the calls that lock `
+            + `it, and those are step, render_video and render_audio`;
+    }
+
+    if (answer.verdict === CORE.load.late) {
+        return `load in task ${task} cannot be given an id: a resource id is `
+            + `the task's id shifted past eight bits, and no task id of `
+            + `16777216 or more fits`;
+    }
+
+    return `load in task ${task} is the body's 257th; a resource id carries an `
+        + `ordinal of eight bits, so a body loads at most 256 resources`;
+}
+
+function commitRefusal (answer) {
+    if (answer.verdict === CORE.commit.crowded) {
+        return `task ${answer.task} would commit ${answer.loads} resource(s) `
+            + `beside the ${answer.counted} this run already counts, past its `
+            + `max_resource_count of ${answer.maxResourceCount}; the task fails and `
+            + `commits nothing, its unloads included`;
+    }
+
+    if (answer.verdict === CORE.commit.heavy) {
+        return `task ${answer.task} would commit ${answer.loadBytes} byte(s) `
+            + `of ${scopeWord (answer.scope)}-scoped resources beside the `
+            + `${answer.countedBytes} this run already counts, past its `
+            + `${scopeMember (answer.scope)} of ${answer.maxResourceBytes}; `
+            + `the task fails and commits nothing, its unloads included`;
+    }
+
+    return `task ${answer.task} unloaded resource ${answer.resource}, which is `
+        + `not live where that unload settles; an unload names a resource the `
+        + `game holds at the boundary that answers the unloading task`;
+}
+
+function lockRefusal (answer, id, call) {
+    const name = callName (call);
+
+    if (answer.verdict === CORE.lock.dead) {
+        return `lock was called in ${name} with resource ${id}, which is not `
+            + `live; a resource is live from the boundary that answers the task `
+            + `that loaded it to the boundary that answers the task that `
+            + `unloads it`;
+    }
+
+    if (answer.verdict === CORE.lock.unscoped) {
+        return `lock was called in ${name} with resource ${id}, whose scope `
+            + `${answer.scope} does not name ${name}; a resource is held only `
+            + `by the calls its scope names`;
+    }
+
+    return `lock was called in ${name} with resource ${id}, which that call `
+        + `already holds; lock and unlock balance within one call`;
+}
+
+function unlockRefusal (id, call) {
+    return `unlock was called in ${callName (call)} with resource ${id}, which `
+        + `that call does not hold; lock and unlock balance within one call`;
+}
+
+function holdingRefusal (closed) {
+    return `${callName (closed.call)} returned holding ${closed.holding} `
+        + `lock(s), resource ${closed.lowest} among them; lock and unlock `
+        + `balance within one call`;
+}
 
 // HOW MANY FRAMES' RUNNER RECORDS ARE KEPT DISTINCT is not written down here
 // any more. It is `host_core_context_ring`, read back through
@@ -408,7 +673,7 @@ const NO_READER = 0;
 // memory, two of them table indices - because a native record holds addresses
 // and a wasm one holds indices, and no core can compose both.
 
-// `console_name_max` and `console_format_max`, the buffers the native host
+// `console_max_name_bytes` and `console_max_format_bytes`, the buffers the native host
 // composes a filename in. Mirrored here so that a descriptor legal by the
 // grammar and too long for the host with a filesystem fails the task on BOTH
 // targets rather than on one - the length is decidable from the module alone,
@@ -419,7 +684,7 @@ const NO_READER = 0;
 // CONTAIN and leaves how long a filename a host composes to the host. The
 // charsets moved into `products/host-core`; these three did not, because they
 // are not the same kind of thing.
-const NAME_MAX = 64, FORMAT_MAX = 16;
+const MAX_NAME_BYTES = 64, MAX_FORMAT_BYTES = 16;
 
 // `Game_Resource`, hand-mirrored for wasm32 like every other offset in LAYOUT:
 // three pointers, four bytes each. Read through the pointer one call hands over
@@ -441,9 +706,9 @@ const NAME_MAX = 64, FORMAT_MAX = 16;
 const RESOURCE_FORMAT_OFFSET = 4, RESOURCE_PATH_OFFSET = 8;
 const RESOURCE_BYTES = 12;
 
-// `console_file_max`, the buffer the native host composes a whole filename in -
+// `console_max_file_bytes`, the buffer the native host composes a whole filename in -
 // `<path>/<name>.<format>` with its terminator. Mirrored here for the reason
-// `NAME_MAX` and `FORMAT_MAX` are, and it is the third of the same family: the
+// `MAX_NAME_BYTES` and `MAX_FORMAT_BYTES` are, and it is the third of the same family: the
 // two of them bound the halves and this bounds what they compose into.
 // `interface/game.h` states what a descriptor may CONTAIN and leaves how long
 // a filename a host composes to the host, so a descriptor legal by the grammar
@@ -451,7 +716,7 @@ const RESOURCE_BYTES = 12;
 // targets rather than on one - the length is decidable from the module and the
 // run alone, which is what makes it the game's own bug rather than a
 // deployment's.
-const PATH_MAX = 128;
+const MAX_PATH_BYTES = 128;
 
 // `Game_Arg`, the pair `construct` is handed - and the one struct in this file
 // that this mirror WRITES rather than reads. Nothing on a module describes it:
@@ -478,8 +743,8 @@ const PAIR = { name: 0, value: 4, bytes: 8 };
 
 // HOW MANY PAIRS A RUN MAY CARRY, how long a name may be and how long a value
 // may be are not written down here any more either. They are
-// `host_core_argument_max`, `host_core_argument_name_max` and
-// `host_core_argument_text_max`, read back through `host_core_figure`, and they
+// `host_core_max_argument_count`, `host_core_max_argument_name_bytes` and
+// `host_core_max_argument_text_bytes`, read back through `host_core_figure`, and they
 // bound the storage that actually holds them - which is the whole reason a
 // capacity belongs to whoever has to store it.
 //
@@ -526,6 +791,35 @@ const SEED_KEY = "seed";
 
 const FRAME_WIDTH = 240, FRAME_HEIGHT = 240;
 const PALETTE_SIZE = 16, FRAME_RATE = 60;
+
+// The frame a module declares, read off its `Game` and resolved: both zero is
+// the console's own, `FRAME_WIDTH` by `FRAME_HEIGHT`. What cannot be resolved
+// comes back as `refusal`, the sentence `console.c` and `goldenhash.js` refuse
+// the same module in - half a declaration, or a figure past the `INT16_MAX` a
+// pointer's coordinate can name - with this page's full stop on it.
+const COORDINATE_LIMIT = 32768;   // INT16_MAX + 1
+
+function declaredFrame (view, gamePtr) {
+    const width = view.getUint32 (gamePtr + LAYOUT.game.frameWidth, true);
+    const height = view.getUint32 (gamePtr + LAYOUT.game.frameHeight, true);
+
+    if ((width !== 0) !== (height !== 0)) {
+        return { refusal: `this module's factory left the Game struct `
+            + `incomplete: frame_width is ${width} and frame_height is `
+            + `${height}, and the two are declared together or not at all.` };
+    }
+
+    for (const [member, figure] of [["frame_width", width],
+                                    ["frame_height", height]]) {
+        if (figure >= COORDINATE_LIMIT) {
+            return { refusal: `this module declares a ${member} of ${figure}, `
+                + `and a pointer's coordinate names at most `
+                + `${COORDINATE_LIMIT - 1}.` };
+        }
+    }
+
+    return { width: width || FRAME_WIDTH, height: height || FRAME_HEIGHT };
+}
 
 // game_sample_rate. Requested explicitly rather than taken from the device:
 // Chrome honours any rate asked for - measured - and pinning it is what makes
@@ -610,7 +904,7 @@ const WASM_MAGIC = [0x00, 0x61, 0x73, 0x6d];
 //
 // The page needs the same move for the same reason and one more of its own. A
 // game that asks for something no host can honour - a runner used after its
-// step, an id asked about after it was released - has said something
+// step, an id asked about after it was finalized - has said something
 // the page cannot answer, and the alternative to refusing is a run nobody can
 // reproduce: on screen a game that plays, and in a recording a run that never
 // happened.
@@ -694,24 +988,26 @@ async function fetchModule (base) {
 // The trampoline: how a host's function gets into a game's table at all.
 //
 // A game module imports NOTHING. `interface/game.h` hands the host over as a
-// `Game_Task_Runner` and a `Game_Resource_Loader`, records whose members are
-// function pointers, and on wasm32 a function pointer is an index into the
-// module's own `__indirect_function_table`. So this host has a problem the
-// native one does not: `console.c` writes the addresses of three `static`
-// functions into its records and is done, and a JavaScript closure is not a
-// wasm function and a funcref table will not hold one.
+// `Game_Task_Runner`, a `Game_Resource_Store` and a `Game_Resource_Loader`,
+// records whose members are function pointers, and on wasm32 a function
+// pointer is an index into the module's own `__indirect_function_table`. So
+// this host has a problem the native one does not: `console.c` writes the
+// addresses of its `static` functions into its records and is done, and a
+// JavaScript closure is not a wasm function and a funcref table will not hold
+// one.
 //
-// `products/trampoline` is the answer, and it is one small wasm module: three
+// `products/trampoline` is the answer, and it is one small wasm module: seven
 // functions with exactly the signatures the record members declare, each
 // forwarding to a closure it was instantiated with. This host instantiates it
-// once per instance it has to reach into - the game's, and a fresh one per task
-// body - grows that instance's table by three and writes the wrappers in, then
-// puts the indices they landed at into the records it composes.
+// once per instance it has to reach into - the game's, each renderer's, and a
+// fresh one per task body - grows that instance's table by seven and writes the
+// wrappers in, then puts the indices they landed at into the records it
+// composes.
 //
-// `docs/archived/capability-records-plan.md` calls this out as what the design accepts,
-// and it is the whole of the cost: one mechanism, built once, tested like
-// anything else. Every rule about a spawn, a release or a read is still on this
-// side of it, in the closures below, where it was when they were imports.
+// `docs/archived/capability-records-plan.md` calls this out as what the design
+// accepts, and it is the whole of the cost: one mechanism, built once, tested
+// like anything else. Every rule about a spawn, a status, a load or a lock is
+// still on this side of it, in the closures below.
 // ---------------------------------------------------------------------------
 
 // The trampoline's own module, over the network, compiled.
@@ -754,18 +1050,21 @@ async function fetchTrampoline (base) {
 // This host's own functions, in one instance's table, at the indices it answers
 // with.
 //
-// `host` is `{ spawn, done, bytes, release, load, read }`, the closures that
-// decide everything; the module below only carries the call across the
-// boundary. One instantiation per game instance and per body instance, because
-// an import is bound at instantiate and the closures differ.
+// `host` is `{ spawn, status, finalize, load, unload, lock, unlock }`, the
+// closures that decide everything; the module below only carries the call
+// across the boundary. One instantiation per game instance and per body
+// instance, because an import is bound at instantiate and the closures differ.
 //
-// The six land at the same indices in every instance of one module, and that
+// The seven land at the same indices in every instance of one module, and that
 // is load bearing rather than incidental: a table's initial length is the
-// module's, so growing by six from the same length gives the same six indices
-// in the game's instance and in a body's. It is what makes a loader record
-// carried out of a body and called through by a `step` land on THIS host's
-// `load` - a refusal naming the rule - rather than on whatever index the game's
-// table happened to hold.
+// module's, so growing by seven from the same length gives the same seven
+// indices in the game's instance and in a body's. It is what makes a loader
+// record carried out of a body and called through by a `step` land on THIS
+// host's `load` - a refusal naming the rule - rather than on whatever index the
+// game's table happened to hold.
+const TRAMPOLINE_SLOTS = ["spawn", "status", "finalize", "load", "unload",
+    "lock", "unlock"];
+
 function installTrampoline (trampoline, instance, host) {
     const table = instance.exports.__indirect_function_table;
 
@@ -776,26 +1075,42 @@ function installTrampoline (trampoline, instance, host) {
     // to, and a table that cannot grow is a module no host can hand a record.
     // `cmake/WasmCompiler.cmake` passes `--growable-table` for exactly this,
     // so a refusal here names the flag rather than the throw.
-    try { at = table.grow (6); }
+    try { at = table.grow (TRAMPOLINE_SLOTS.length); }
     catch (error) {
         refuse (`this module's function table will not grow, so this host has `
-            + `nowhere to put the six functions a \`Game_Task_Runner\`, a `
-            + `\`Game_Resource_Loader\` and a \`Game_Task_Reader\` are made `
+            + `nowhere to put the seven functions a \`Game_Task_Runner\`, a `
+            + `\`Game_Resource_Store\` and a \`Game_Resource_Loader\` are made `
             + `of. A module is linked with --growable-table for that reason; `
             + `this one was not.`);
     }
 
     const shim = new WebAssembly.Instance (trampoline, { host });
 
-    table.set (at, shim.exports.spawn);
-    table.set (at + 1, shim.exports.done);
-    table.set (at + 2, shim.exports.bytes);
-    table.set (at + 3, shim.exports.release);
-    table.set (at + 4, shim.exports.load);
-    table.set (at + 5, shim.exports.read);
+    const slots = {};
 
-    return { spawn: at, done: at + 1, bytes: at + 2, release: at + 3,
-             load: at + 4, read: at + 5 };
+    TRAMPOLINE_SLOTS.forEach ((name, index) => {
+        table.set (at + index, shim.exports [name]);
+
+        slots [name] = at + index;
+    });
+
+    return slots;
+}
+
+// The seven closures of a host that answers nothing, which is what a body's
+// instance and a renderer's install for every member they have no business
+// calling: the seven wrappers land at fixed indices in every instance of one
+// module, so every instance installs all seven.
+function inertServices () {
+    return {
+        spawn: () => 0,
+        status: () => 0,
+        finalize: () => {},
+        load: () => 0,
+        unload: () => {},
+        lock: () => {},
+        unlock: () => {},
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -928,21 +1243,27 @@ class HostCore {
     // the compaction moves it with the entry, and this host keeps a JavaScript
     // object per id instead - a `Uint8Array` of output bytes and a line saying
     // why there are none do not fit in a byte span.
-    begin (taskMax) {
-        const span = this.ex.host_core_size (taskMax, 0) >>> 0;
+    //
+    // `maxScratchBytes` sizes nothing here and is not a parameter of
+    // `host_core_size` for that reason: it is the ceiling a spawn's
+    // `scratch_size` is judged against, taken once so that no call can pass a
+    // different one.
+    begin (maxTaskCount, maxScratchBytes) {
+        const span = this.ex.host_core_size (maxTaskCount, 0) >>> 0;
 
         if (! span) {
-            refuse (`this module declares task_max ${taskMax}, which is more `
+            refuse (`this module declares max_task_count ${maxTaskCount}, which is more `
                 + `than the rules a session needs can be sized for on this `
                 + `target. It is a run to refuse exactly as a \`Game.size\` `
                 + `that will not map is.`);
         }
 
-        return this.ex.host_core_begin (this.alloc (span), taskMax, 0) >>> 0;
+        return this.ex.host_core_begin (this.alloc (span), maxTaskCount,
+            maxScratchBytes >>> 0, 0) >>> 0;
     }
 
     holder () {
-        if (! this.held) { this.held = this.begin (0); }
+        if (! this.held) { this.held = this.begin (0, 0); }
 
         return this.held;
     }
@@ -982,9 +1303,9 @@ class HostCore {
     // two malformed shapes, the game's own live count, and the table this host
     // cannot outgrow.
     //
-    // The descriptor goes across as the twenty bytes of `Game_Task` the rules
-    // read, with `name` left null: nothing in the rulebook reads a task's name,
-    // and this host keeps its own beside the id.
+    // The descriptor goes across as the `Game_Task` bytes the rules read, with
+    // `name` left null: nothing in the rulebook reads a task's name, and this
+    // host keeps its own beside the id.
     spawn (host, task, carried) {
         const at = this.scratch (LAYOUT.task.bytes + CORE.spawn.bytes);
         const answerAt = at + LAYOUT.task.bytes;
@@ -996,9 +1317,9 @@ class HostCore {
             compose.setUint32 (at + LAYOUT.task.body, task.body, true);
             compose.setUint32 (at + LAYOUT.task.inputSize, task.inputSize,
                 true);
-            compose.setUint32 (at + LAYOUT.task.scratchSize, task.scratchSize,
-                true);
             compose.setUint32 (at + LAYOUT.task.outputSize, task.outputSize,
+                true);
+            compose.setUint32 (at + LAYOUT.task.scratchSize, task.scratchSize,
                 true);
         }
 
@@ -1011,22 +1332,209 @@ class HostCore {
             id: answer.getUint32 (answerAt + CORE.spawn.id, true),
             verdict: answer.getInt32 (answerAt + CORE.spawn.verdict, true),
             inputSize: answer.getUint32 (answerAt + CORE.spawn.inputSize, true),
+            scratchSize: answer.getUint32 (answerAt + CORE.spawn.scratchSize,
+                true),
+            maxScratchBytes: answer.getUint32 (
+                answerAt + CORE.spawn.maxScratchBytes, true),
         };
     }
 
-    // Whether an id is one the game may ask about at all, which is the verdict
-    // three hosts have to reach identically and the one thing a game cannot
-    // work out for a host.
-    checkId (host, id) {
-        return this.ex.host_core_check_id (host, id);
+    // A session's resource store, in a block of its own beside the task table.
+    // A consumer holds one of these and no session at all, which is why it is
+    // laid out by its own pair of calls.
+    beginResources (maxResourceCount, maxTaskCount, bytes) {
+        const span = this.ex.host_core_resources_size (maxResourceCount,
+            maxTaskCount, bytes.game, bytes.video, bytes.audio) >>> 0;
+
+        if (! span) {
+            refuse (`this module declares max_resource_count ${maxResourceCount}, which is `
+                + `more than the store a session needs can be sized for on this `
+                + `target. It is a run to refuse exactly as a \`Game.size\` `
+                + `that will not map is.`);
+        }
+
+        return this.ex.host_core_resources_begin (this.alloc (span),
+            maxResourceCount, maxTaskCount, bytes.game, bytes.video,
+            bytes.audio) >>> 0;
     }
 
-    done (host, id) { return !! this.ex.host_core_done (host, id); }
+    // What a task is, and whether the id was one the game may ask about, which
+    // is the verdict three hosts have to reach identically and the one thing a
+    // game cannot work out for a host.
+    status (host, id) {
+        const at = this.scratch (4);
+        const verdict = this.ex.host_core_status (host, id, at);
 
-    // The block the id answered with, as the opaque number this host gave the
-    // rulebook - which here is an address in the GAME's linear memory, and is
-    // what `bytes` hands straight back to the game.
-    bytes (host, id) { return this.ex.host_core_bytes (host, id) >>> 0; }
+        return { verdict, status: this.view ().getInt32 (at, true) };
+    }
+
+    // Ends a task from the call, and says what there is to copy: the output's
+    // address in the GAME's linear memory, which is the opaque number this host
+    // gave the rulebook at the answer.
+    finalize (host, id) {
+        const at = this.scratch (CORE.finalized.bytes);
+
+        this.ex.host_core_finalize (host, id, at);
+
+        const view = this.view ();
+
+        return {
+            verdict: view.getInt32 (at + CORE.finalized.verdict, true),
+            status: view.getInt32 (at + CORE.finalized.status, true),
+            block: view.getUint32 (at + CORE.finalized.block, true),
+            outputSize: view.getUint32 (at + CORE.finalized.outputSize, true),
+        };
+    }
+
+    // One load a body made, answered on the body's side with no session.
+    checkLoad (task, loads, scope) {
+        const at = this.scratch (CORE.loadAnswer.bytes);
+
+        this.ex.host_core_check_load (task, loads, scope, at);
+
+        const view = this.view ();
+
+        return {
+            id: view.getUint32 (at + CORE.loadAnswer.id, true),
+            verdict: view.getInt32 (at + CORE.loadAnswer.verdict, true),
+            task: view.getUint32 (at + CORE.loadAnswer.task, true),
+            loads: view.getUint32 (at + CORE.loadAnswer.loads, true),
+            scope: view.getUint32 (at + CORE.loadAnswer.scope, true),
+        };
+    }
+
+    // What a body loaded and unloaded, recorded with its answer: `loads` is
+    // `[{ bytes, span, size, scope }]` in load order, `bytes` being the address
+    // this host gave the load, and `unloads` the ids in the order the body made
+    // them.
+    answerResources (host, store, task, loads, unloads) {
+        const stride = CORE.loaded.stride;
+        const at = this.scratch (loads.length * stride + unloads.length * 4
+            + 4);
+        const unloadsAt = at + loads.length * stride;
+        const view = this.view ();
+
+        loads.forEach ((load, index) => {
+            const entry = at + index * stride;
+
+            view.setUint32 (entry + CORE.loaded.bytes, load.bytes, true);
+            view.setUint32 (entry + CORE.loaded.span, load.span, true);
+            view.setUint32 (entry + CORE.loaded.size, load.size, true);
+            view.setUint32 (entry + CORE.loaded.scope, load.scope, true);
+        });
+
+        unloads.forEach ((id, index) => {
+            view.setUint32 (unloadsAt + index * 4, id, true);
+        });
+
+        return !! this.ex.host_core_answer_resources (host, store, task,
+            loads.length ? at : 0, loads.length,
+            unloads.length ? unloadsAt : 0, unloads.length, 0);
+    }
+
+    // One step of a boundary's commit. `blocks` is null for the reason
+    // `retire` below gives, and the arena reconciles after it.
+    commit (host, store) {
+        const at = this.scratch (CORE.committed.bytes);
+
+        this.ex.host_core_commit (host, store, 0, at);
+
+        const view = this.view ();
+        const field = (name) => view.getUint32 (at + CORE.committed [name],
+            true);
+
+        return {
+            verdict: view.getInt32 (at + CORE.committed.verdict, true),
+            task: field ("task"),
+            resource: field ("resource"),
+            loads: field ("loads"),
+            counted: field ("counted"),
+            maxResourceCount: field ("maxResourceCount"),
+            scope: field ("scope"),
+            loadBytes: field ("loadBytes"),
+            countedBytes: field ("countedBytes"),
+            maxResourceBytes: field ("maxResourceBytes"),
+        };
+    }
+
+    retireResources (host, store) {
+        this.ex.host_core_retire_resources (host, store, 0);
+    }
+
+    resourceCount (store) {
+        return this.ex.host_core_resource_count (store) >>> 0;
+    }
+
+    // One row of the store, read out into a plain object and never kept: an
+    // entry belongs to the block and moves whenever the table compacts.
+    resource (store, index) {
+        const at = this.ex.host_core_resource (store, index) >>> 0;
+
+        if (! at) { return null; }
+
+        const view = this.view ();
+        const bytes = new Uint8Array (this.ex.memory.buffer);
+        const row = CORE.resourceRow;
+
+        return {
+            id: view.getUint32 (at + row.id, true),
+            scope: view.getUint32 (at + row.scope, true),
+            size: view.getUint32 (at + row.size, true),
+            committed: view.getUint32 (at + row.committed, true),
+            unloaded: view.getUint32 (at + row.unloaded, true),
+            unloader: view.getUint32 (at + row.unloader, true),
+            address: view.getUint32 (at + row.bytes, true),
+            span: view.getUint32 (at + row.span, true),
+            dead: !! bytes [at + row.dead],
+        };
+    }
+
+    openCall (store, call) { this.ex.host_core_open_call (store, call); }
+
+    lock (store, id) {
+        const at = this.scratch (CORE.locked.stride);
+
+        this.ex.host_core_lock (store, id, at);
+
+        const view = this.view ();
+
+        return {
+            verdict: view.getInt32 (at + CORE.locked.verdict, true),
+            scope: view.getUint32 (at + CORE.locked.scope, true),
+            size: view.getUint32 (at + CORE.locked.size, true),
+            bytes: view.getUint32 (at + CORE.locked.bytes, true),
+        };
+    }
+
+    unlock (store, id) { return this.ex.host_core_unlock (store, id); }
+
+    closeCall (store) {
+        const at = this.scratch (CORE.closed.bytes);
+
+        this.ex.host_core_close_call (store, at);
+
+        const view = this.view ();
+
+        return {
+            verdict: view.getInt32 (at + CORE.closed.verdict, true),
+            call: view.getUint32 (at + CORE.closed.call, true),
+            holding: view.getUint32 (at + CORE.closed.holding, true),
+            lowest: view.getUint32 (at + CORE.closed.lowest, true),
+        };
+    }
+
+    // A consumer's store, filled from the table a session published rather
+    // than by a commit.
+    mirrorClear (store) { this.ex.host_core_mirror_clear (store); }
+
+    mirrorEntry (store, id, scope, size, bytes, dead) {
+        return !! this.ex.host_core_mirror_entry (store, id, scope, size, bytes,
+            dead ? 1 : 0);
+    }
+
+    resourceId (task, ordinal) {
+        return this.ex.host_core_resource_id (task, ordinal) >>> 0;
+    }
 
     answer (host, id, finished, block, span) {
         this.ex.host_core_answer (host, id, finished ? 1 : 0, block, span);
@@ -1036,26 +1544,21 @@ class HostCore {
         return !! this.ex.host_core_stage (host, id, abandoned ? 1 : 0);
     }
 
-    // `blocks` is NULL at both of these, and it is the one place this host
-    // cannot follow the console.
+    // `blocks` is NULL at every call that takes one, and it is the one place
+    // this host cannot follow the console.
     //
     // `Host_Core_Blocks.reclaim` is a function pointer, which on wasm32 is an
     // index into the CORE's own table - and a JavaScript closure is not a wasm
     // function, exactly as it is not one in a game's table.
     // `products/trampoline` is the answer to that problem for a game and cannot
-    // be the answer here: its six wrappers carry the six signatures
-    // `Game_Task_Runner`, `Game_Resource_Loader` and `Game_Task_Reader`
-    // declare, and `reclaim`'s is none of them. The core guards for a record it was not given, so it drops
-    // the block and says nothing, and `Session.reclaimBlocks` reconciles
-    // afterwards: every address this host's arena holds that no row of the
-    // table names any more goes back on the spare list. That decides nothing -
-    // which entries end, and when, is still read off the table the rules left.
-    //
-    // `release` takes no record at all now, on any host: a release marks the
-    // entry and settles at the frame boundary, so `retire` below is the one
-    // call that can hand a released block back.
-    release (host, id) { this.ex.host_core_release (host, id); }
-
+    // be the answer here: its seven wrappers carry the seven signatures
+    // `Game_Task_Runner`, `Game_Resource_Store` and `Game_Resource_Loader`
+    // declare, and `reclaim`'s is none of them. The core guards for a record it
+    // was not given, so it drops the block and says nothing, and
+    // `Session.reclaimBlocks` reconciles afterwards: every address this host's
+    // arena holds that no row of either table names any more goes back on the
+    // spare list. That decides nothing - which entries end, and when, is still
+    // read off the tables the rules left.
     retire (host) { this.ex.host_core_retire (host, 0); }
 
     show (host) { this.ex.host_core_show (host, 0); }
@@ -1249,7 +1752,7 @@ class HostCore {
     // The three capacities are PARAMETERS, which is `interface/game.h`'s
     // arrangement rather than an omission: it says what a descriptor may
     // contain and leaves how long a filename a host composes to the host.
-    checkResource (name, format, path, nameMax, formatMax, fileMax) {
+    checkResource (name, format, path, maxNameBytes, maxFormatBytes, maxFileBytes) {
         const at = this.scratch (RESOURCE_BYTES + 4
             + name.length + format.length + path.length + 3);
 
@@ -1275,8 +1778,8 @@ class HostCore {
         compose.setUint32 (at + RESOURCE_FORMAT_OFFSET, formatAt, true);
         compose.setUint32 (at + RESOURCE_PATH_OFFSET, pathAt, true);
 
-        const verdict = this.ex.host_core_check_resource (at, nameMax,
-            formatMax, fileMax, composedAt);
+        const verdict = this.ex.host_core_check_resource (at, maxNameBytes,
+            maxFormatBytes, maxFileBytes, composedAt);
 
         return { verdict,
                  composed: this.view ().getUint32 (composedAt, true) };
@@ -1294,7 +1797,8 @@ class HostCore {
 //
 // It answers a MODULE rather than an instance, like `fetchTrampoline`, because
 // a session wants one of its own: an instance is a linear memory, and a reset
-// is a new one.
+// is a new one. And the BYTES beside it, for `fetchTrampoline`'s reason: the
+// audio thread holds a store of its own and cannot be handed a module.
 async function fetchCore (base) {
     let response;
 
@@ -1312,7 +1816,9 @@ async function fetchCore (base) {
             + `${response.status} ${response.statusText}.`);
     }
 
-    return new WebAssembly.Module (await response.arrayBuffer ());
+    const bytes = await response.arrayBuffer ();
+
+    return { module: new WebAssembly.Module (bytes), bytes };
 }
 
 // ---------------------------------------------------------------------------
@@ -1551,8 +2057,8 @@ function resourceReader (base, codecBase) {
 // instantiate, so a spawn costs the second of those and the module is compiled
 // once, wherever it is compiled.
 //
-// The answer is `{ output, note, reads }`, and a null `output` becomes the null
-// the runner's `bytes` hands the game, which means one thing only: the host
+// The answer is `{ output, note, reads }`, and a null `output` becomes a
+// failure the runner's `status` answers, which means one thing only: the host
 // could not run it, the host abandoned it, or the body did not finish. `note`
 // is what `Console_Task.diagnostic` is natively - what the run has to say about
 // the failure - and there is far less of it for a trap here, because a wasm
@@ -1600,11 +2106,12 @@ function resourceReader (base, codecBase) {
 // the body's own instance, on the thread the body runs on, so the six rules a
 // `Game_Resource` is held to have to be reachable from there. It is the ONE
 // thing about a task the rulebook is needed for on this side of the message -
-// a body's own `spawn` and `release` are inert wrappers, because
-// `interface/game.h` says a body reads files and cannot spawn - so what a
+// a body's own `spawn`, `status` and `finalize` are inert wrappers, because
+// `interface/game.h` says a body loads files and cannot spawn - so what a
 // worker gets is a compiled module and an instance of its own rather than a
 // session.
-function runTaskBody (module, trampoline, core, task, input, read) {
+function runTaskBody (module, trampoline, core, id, task, input, read,
+    maxResourceCount) {
     let instance;
 
     // Every read the body made and what became of it, IN CALL ORDER and kept
@@ -1612,10 +2119,21 @@ function runTaskBody (module, trampoline, core, task, input, read) {
     // and is what a reader wants to see first.
     const reads = [];
 
-    // The three parts of `interface/game.h`'s six failures that are decidable
-    // from the module and the call alone, then the deployment's, then the
-    // host's. Every one of them throws, and none of them returns.
-    const readResource = (context, resource, buffer, capacity) => {
+    // What the body loaded, in load order, and the ids it unloaded, in call
+    // order. THE BYTES ARE NOT MATERIALISED HERE: a body never sees what it
+    // loads, and a scope names the simulation and the renderers rather than a
+    // body's instance, so they ride back with the answer and the session puts
+    // them where the scope says.
+    const loads = [];
+    const unloads = [];
+
+    // Past one more than `max_resource_count`, an unload changes nothing a commit can
+    // say: among that many at least one is dead where it settles.
+    const unloadsKept = (maxResourceCount >>> 0) + 1;
+
+    // The grammar, then the load's own refusals, then the deployment's, then
+    // the host's. Every one of them throws, and none of them returns.
+    const readResource = (context, resource, scope) => {
         // The record rule, and the one shape a game can break it in: a body
         // wrote its loader into the output and a `step` read it back. That call
         // reaches the session's own `load` rather than this one, which answers
@@ -1660,8 +2178,8 @@ function runTaskBody (module, trampoline, core, task, input, read) {
         // things in its own voice, and the same document measures that the
         // three hosts do not word them alike, so the core answers a verdict and
         // a length and this composes what the page has always said.
-        const held = core.checkResource (name, format, path, NAME_MAX,
-            FORMAT_MAX, PATH_MAX);
+        const held = core.checkResource (name, format, path, MAX_NAME_BYTES,
+            MAX_FORMAT_BYTES, MAX_PATH_BYTES);
 
         if (held.verdict === CORE.resource.unnamed) {
             refuse (`"${name}" is not a resource name: a name is [a-z0-9_]+, `
@@ -1686,20 +2204,22 @@ function runTaskBody (module, trampoline, core, task, input, read) {
 
         if (held.verdict === CORE.resource.longToken) {
             refuse (`"${name}.${format}" is longer than a host composes `
-                + `filenames of (${NAME_MAX - 1} and ${FORMAT_MAX - 1} bytes)`);
+                + `filenames of (${MAX_NAME_BYTES - 1} and ${MAX_FORMAT_BYTES - 1} bytes)`);
         }
 
         if (held.verdict === CORE.resource.longFile) {
             refuse (`"${file}" is ${file.length + 1} bytes with its `
                 + `terminator, and this host composes filenames of `
-                + `${PATH_MAX}; it is the last of the six rules a `
+                + `${MAX_PATH_BYTES}; it is the last of the six rules a `
                 + `descriptor is held to.`);
         }
 
-        if (! buffer) {
-            refuse (`${file} was read into a null buffer; a size `
-                + `probe is a reserved extension rather than a mode`);
-        }
+        // The load's own four refusals, decided on this side with no session:
+        // a scope naming no call, a task past the id bound, a body past its
+        // 256th load.
+        const answer = core.checkLoad (id, loads.length, scope >>> 0);
+
+        if (answer.verdict !== CORE.load.taken) { refuse (loadRefusal (answer)); }
 
         if (! read) {
             refuse (`${file} cannot be read: this host was pointed `
@@ -1711,24 +2231,26 @@ function runTaskBody (module, trampoline, core, task, input, read) {
         try { bytes = read (name, format, path); }
         catch (error) { refuse (`${error.message || error}`); }
 
-        if (bytes.length > capacity) {
-            refuse (`${name}.${format} does not fit: the read offered `
-                + `${capacity} bytes and ${name}.${format} is ${bytes.length}`);
-        }
-
-        // The view is built HERE rather than kept, and that is a measured
-        // hazard rather than housekeeping: a body that reads a large asset is
-        // exactly a body that grew its own memory to hold one, and
-        // `memory.grow` detaches every view the host is holding.
-        // `docs/archived/unified-tasks-phase0/probes.md` section 2 measured the
-        // failure as a loud `TypeError` from `set` on a detached buffer, and
-        // measured rebuilding per call as the fix.
-        new Uint8Array (ex.memory.buffer, buffer, bytes.length).set (bytes);
+        // A copy of its own, because a reader caches by filename and the answer
+        // transfers what it carries: a second load of one file is a second
+        // resource and a second buffer.
+        loads.push ({ file, scope: scope >>> 0, bytes: bytes.slice () });
 
         reads.push ({ name, format, size: bytes.length, failed: false,
                       reason: null });
 
-        return bytes.length;
+        return answer.id;
+    };
+
+    // Nothing is judged at the call - an unload is judged where it settles -
+    // so what is left here is the record rule and the bound above.
+    const unloadResource = (context, unloaded) => {
+        if (context !== LOADER) {
+            throw new Error ("a loader this body was not handed was used to "
+                + "unload a resource");
+        }
+
+        if (unloads.length < unloadsKept) { unloads.push (unloaded >>> 0); }
     };
 
     // The module imports nothing, so it instantiates against nothing - and
@@ -1748,12 +2270,9 @@ function runTaskBody (module, trampoline, core, task, input, read) {
         instance = new WebAssembly.Instance (module, {});
 
         slots = installTrampoline (trampoline, instance, {
+            ...inertServices (),
             load: readResource,
-            spawn: () => 0,
-            done: () => 0,
-            bytes: () => 0,
-            release: () => {},
-            read: () => 0,
+            unload: unloadResource,
         });
     }
     catch (error) {
@@ -1805,6 +2324,15 @@ function runTaskBody (module, trampoline, core, task, input, read) {
     // because `memory.grow` detaches every view of the buffer and the last
     // allocation is exactly what may have grown it. A zero sized part still
     // takes a byte, so that no two of them are the same address.
+    //
+    // SCRATCH IS ZERO WITHOUT BEING FILLED, and what makes that true is the
+    // instance rather than anything here: it was made for this body and runs no
+    // other, so every byte above `__heap_base` is a byte linear memory began at
+    // zero and a `memory.grow` zero fills whatever it adds. A worker is one task's
+    // (`TaskRunner` below), and the inline path makes a fresh instance per
+    // call, so there is no reuse to clear after. Growing here is free of every
+    // deadline this host has: a body's instance is the task worker's, which
+    // draws nothing and renders no sound.
     const loaderAt = room (LAYOUT.loader.bytes);
     const inputAt = room (task.inputSize || 1);
     const scratchAt = room (task.scratchSize || 1);
@@ -1818,6 +2346,8 @@ function runTaskBody (module, trampoline, core, task, input, read) {
 
         compose.setUint32 (loaderAt + LAYOUT.loader.context, LOADER, true);
         compose.setUint32 (loaderAt + LAYOUT.loader.load, slots.load, true);
+        compose.setUint32 (loaderAt + LAYOUT.loader.unload, slots.unload,
+            true);
     }
 
     if (task.inputSize) {
@@ -1842,6 +2372,8 @@ function runTaskBody (module, trampoline, core, task, input, read) {
             task.outputSize).slice (),
         note: null,
         reads,
+        loads,
+        unloads,
     };
 }
 
@@ -1854,16 +2386,14 @@ function runTaskBody (module, trampoline, core, task, input, read) {
 // promise is the same promise either way, so nothing above here has two paths.
 //
 // ONE WORKER PER LIVE TASK, created at the spawn, ended at the answer, and
-// ended at a release that beats the answer. What it replaced is a single
+// ended at a `finalize` that beats the answer. What it replaced is a single
 // resident worker every body queued behind, and the reversal buys two things
 // that one could not offer.
 //
-// A release before the answer becomes a REAL CANCEL. A runner's `release` has
-// always promised the game that the id it took is never answered, and the
-// resident worker kept that promise by throwing the answer away at the doorstep
-// while the body ran on to the end. A worker of its own can be
-// terminated where it stands, because nothing else is behind it, so the promise
-// is now kept by stopping the work rather than by discarding it.
+// A pending `finalize` becomes a REAL CANCEL. It promises the game that the id
+// it took is never answered, and a worker of its own can be terminated where it
+// stands, because nothing else is behind it, so the promise is kept by stopping
+// the work rather than by discarding it.
 //
 // And the two hosts stop being asymmetric about who runs a body. `console.c`
 // forks a process at the spawn; this starts a thread at the spawn. One body,
@@ -1955,6 +2485,11 @@ class TaskRunner {
         // are the same question now, and a runner that kept them apart could
         // answer them differently.
         this.live = new Map ();
+
+        // The module's own `max_resource_count`, set by the session once it has read
+        // the declaration: a body's side keeps one more unload than it, and the
+        // runner is built before the module is instantiated.
+        this.maxResourceCount = 0;
     }
 
     // Whether a body will leave this thread. Nothing about the output depends
@@ -1968,7 +2503,7 @@ class TaskRunner {
     run (id, task, input) {
         if (! this.offloads ()) {
             return Promise.resolve (runTaskBody (this.module, this.trampoline,
-                this.core, task, input, this.read));
+                this.core, id, task, input, this.read, this.maxResourceCount));
         }
 
         const worker = new Worker (this.workerUrl);
@@ -1976,7 +2511,7 @@ class TaskRunner {
         return new Promise (resolve => {
             // The one answer this worker exists to give, however it arrives.
             // The entry is struck BEFORE the thread is ended and before the
-            // promise settles, so a second message, or a release racing this
+            // promise settles, so a second message, or a cancel racing this
             // one, finds nothing here and does nothing.
             const answer = (value) => {
                 if (! this.live.delete (id)) { return; }
@@ -1989,9 +2524,10 @@ class TaskRunner {
             this.live.set (id, worker);
 
             worker.onmessage = (event) => {
-                const { output, note, reads } = event.data;
+                const { output, note, reads, loads, unloads } = event.data;
 
-                answer ({ output, note, reads: reads || [] });
+                answer ({ output, note, reads: reads || [],
+                    loads: loads || [], unloads: unloads || [] });
             };
 
             // A worker that cannot load its script, or that dies, answers
@@ -2000,8 +2536,8 @@ class TaskRunner {
             // and every task beside it is untouched, because every task beside
             // it is another thread. Everything else in this file treats "the
             // host could not run it" and "the body trapped" as one condition,
-            // and the interface is why: `done` with a null `bytes` is all the
-            // game is told, and no output is coming under either.
+            // and the interface is why: a failed status is all the game is
+            // told, and no output is coming under either.
             worker.onerror = (event) => {
                 answer ({ output: null, reads: [],
                     note: `the task worker failed: `
@@ -2014,28 +2550,26 @@ class TaskRunner {
             // because this worker will never be sent a second one.
             worker.postMessage ({ id, module: this.module,
                 trampoline: this.trampoline, core: this.core.module,
-                resources: this.base, task, input });
+                resources: this.base, maxResourceCount: this.maxResourceCount, task,
+                input });
         });
     }
 
-    // A task the game has released before its answer arrived, which the header
-    // makes a cancel - and which is a cancel in fact now rather than only in
-    // what the game is told.
+    // A task the game has finalized before its answer arrived, which the header
+    // makes a cancel - and which is a cancel in fact rather than only in what
+    // the game is told.
     //
     // Two halves. The entry is struck, so an answer already in the air is
     // dropped above: that is the half which has to be true whatever else
-    // happens, since a runner's `release` promises the id it took is never
-    // answered. And the thread is ENDED, so a body that has
-    // not finished never does - which the resident worker could not do, because
-    // killing it to stop one body took every body queued behind it. Nothing is
-    // queued behind this one.
+    // happens, since a pending `finalize` promises the id it took is never
+    // answered. And the thread is ENDED, so a body that has not finished never
+    // does. Nothing is queued behind it, because a worker is one task's.
     //
-    // A game observes neither half, and that is the point: the promise it was
-    // given is the same promise, kept by stopping the work instead of by
-    // discarding it. `console.c` cannot follow it here for a reason that is
-    // about its own shape rather than about the rule - it forks and WAITS, so
-    // the body has already run to completion by the time a release can name it.
-    release (id) {
+    // A game observes neither half, and that is the point. `console.c` cannot
+    // follow it here for a reason that is about its own shape rather than about
+    // the rule - it forks and WAITS, so the body has already run to completion
+    // by the time a `finalize` can name it.
+    cancel (id) {
         const worker = this.live.get (id);
 
         if (! worker) { return; }
@@ -2058,7 +2592,7 @@ class TaskRunner {
 
 // Which arena block a size takes, rounded up to a power of two from sixteen.
 //
-// The bump allocator has no free, so a released block is kept on a spare list
+// The bump allocator has no free, so a finalized block is kept on a spare list
 // and handed to the next answer of the same shape. Keyed by an exact size that
 // works perfectly for the shape the header recommends - `output_size` is a
 // constant on a static descriptor, so sizes recur by construction and recycling
@@ -2068,7 +2602,7 @@ class TaskRunner {
 //
 // Rounding bounds that at about twenty classes over every size a 240x240
 // console can produce, for at most 2x internal waste, and the game can tell by
-// nothing: the runner's `bytes` carries no size, the block is written to exactly
+// nothing: `finalize` takes no size, the block is written to exactly
 // `output_size` and read to exactly `output_size`, and the slack is cleared
 // when a block is recycled so two hosts cannot differ about it either.
 //
@@ -2253,6 +2787,329 @@ function watchStore (frame, page, current, period = SAVE_PERIOD) {
 }
 
 // ---------------------------------------------------------------------------
+// ResourceSpace: the region ONE INSTANCE holds ONE SCOPE's resources in, as two
+// halves it moves between.
+//
+// A region of an instance's memory rather than a memory of its own: an instance
+// reserves twice its declared figure once, when the run opens, and never grows
+// for a resource again. That reservation is the whole reason this class exists
+// - a `memory.grow` detaches every view in the instance, and a grow taken on a
+// thread with a deadline is a copy nothing can budget.
+//
+// TWO HALVES, ONE ACTIVE, and a bump pointer in it. A freed resource leaves a
+// hole that nothing reuses until the next compaction, and a compaction runs
+// only when a placement needs one: the load fits by sum but not in what is left
+// of the active half. Every copy then lands in FREE space in the other half, so
+// no move can overwrite bytes a call is still reading and a compaction always
+// completes - which is what the alternatives could not promise, and
+// `docs/resource-space-plan.md` §10 is where the two that wedge are written
+// down.
+//
+// PLACEMENT IS CHUNKED, through two primitives and no more: `pending` asks
+// whether there is work and `copy` does at most so many bytes of it. What
+// spends them is the caller's business - this file drives them to completion
+// where the bytes arrive, which is where the copy happened before this class
+// existed, and the loop that spends them against a deadline is the plan's phase
+// 7. So an answer's frame is exactly what it was.
+//
+// A SWITCH INSIDE A CALL IS REFUSED rather than deferred. A block's entry moves
+// to its new address in the gap AFTER its last chunk lands, so a call between
+// chunks locks the old address, which is complete and correct because a
+// resource is never written. A switch under a call that is already open would
+// give one lock two addresses, and there is no answer to that but to stop.
+// ---------------------------------------------------------------------------
+
+// How many bytes one `copy` is asked for where a placement is driven to
+// completion. It is a chunk rather than the whole resource so that the chunked
+// path is the path every load takes, and it decides nothing a game can see -
+// how far a placement gets in one gap is what the deadline loop of the plan's
+// phase 7 will decide, and this figure goes with that loop.
+const PLACEMENT_CHUNK = 64 * 1024;
+
+class ResourceSpace {
+    // `memory` is the instance's own linear memory and `base` the first byte of
+    // the region, which is `2 * half` bytes long; `half` is the figure the
+    // module declared for `scope`, and `scope` is the bit it declared it for -
+    // the two words every refusal below is spelled with come off it.
+    //
+    // A `half` of zero is a scope the game declared none for: the region is
+    // nothing, and a `place` into it is refused rather than attempted. Such a
+    // load already fails at its commit, so nothing should ever reach it.
+    constructor (memory, base, half, scope) {
+        this.memory = memory;
+        this.base = base >>> 0;
+        this.half = half >>> 0;
+        this.scope = scope;
+
+        // Which half is active, as its offset from `base`: 0 or `half`.
+        this.active = 0;
+
+        // The bump pointer in that half, as an offset into it. It covers the
+        // placement in flight as well as the blocks that have landed, because
+        // a placement takes its whole run the moment its first chunk does.
+        this.top = 0;
+
+        // Where each live resource is: id to `{ address, size }`, and the one
+        // thing a caller may ask an address of. An entry appears when a
+        // placement's last chunk lands and moves when a compaction's does.
+        this.table = new Map ();
+
+        // The placements waiting, oldest first, each `{ id, source, copied,
+        // at }`. `source` is the bytes as they arrived and is dropped the
+        // moment the last chunk lands, because an `ArrayBuffer` kept reachable
+        // after placement is pressure for nothing.
+        this.queue = [];
+
+        // The compaction in flight, or null. It exists only while a placement
+        // waits on it.
+        this.moving = null;
+
+        // The one view over the whole memory, kept and re-made only when the
+        // buffer under it has been detached - an identity check that allocates
+        // nothing, which is what §3 of the plan asks of the gap loop.
+        this.bytes = null;
+
+        // How deep the instance is inside a call, which is the whole of what
+        // the switch refusal reads.
+        this.calls = 0;
+    }
+
+    // The region an instance takes for one scope when the run opens, and the
+    // refusal a machine that cannot spare it earns.
+    //
+    // `alloc` is the instance's own bump allocator, so the region is a hole in
+    // the arena like every other one this host lays down, and it is what grows
+    // the memory - a grow that cannot be honoured throws, and what a reader
+    // would otherwise see is a `RangeError` out of an arena rather than the
+    // member they would edit.
+    static reserve (memory, alloc, half, scope) {
+        if (! half) { return new ResourceSpace (memory, 0, 0, scope); }
+
+        let base = 0;
+
+        try {
+            base = alloc (2 * half);
+        } catch (error) {
+            refuse (`this module declares ${scopeMember (scope)} ${half}, `
+                + `which is more than this instance can reserve twice over. A `
+                + `space is two halves of that figure, so that a resource can `
+                + `be moved into free bytes rather than over bytes a call is `
+                + `reading.`);
+        }
+
+        return new ResourceSpace (memory, base, half, scope);
+    }
+
+    // The kept view, made once and re-made only when a growth elsewhere in the
+    // instance has detached it.
+    view () {
+        if (! this.bytes || this.bytes.buffer !== this.memory.buffer) {
+            this.bytes = new Uint8Array (this.memory.buffer);
+        }
+
+        return this.bytes;
+    }
+
+    // The bytes this space is holding for resources that are live or on their
+    // way to being live, which is what a caller weighs a load against.
+    held () {
+        let bytes = 0;
+
+        for (const entry of this.table.values ()) { bytes += entry.size; }
+
+        for (const placement of this.queue) {
+            bytes += placement.source.length;
+        }
+
+        return bytes;
+    }
+
+    // Where a resource's bytes are, or 0 for one this space is not holding. A
+    // block being moved answers its OLD address until its last chunk lands,
+    // which is exactly what makes a lock between two chunks correct.
+    addressOf (id) {
+        const entry = this.table.get (id);
+
+        return entry ? entry.address : 0;
+    }
+
+    // One resource queued, as the bytes it arrived as. Nothing is copied here:
+    // what copies is `copy`, and when it runs is the caller's.
+    //
+    // The two refusals are both bugs rather than paths. A load into a scope the
+    // module declared nothing for, and a load that does not fit by sum, each
+    // fail at their commit - `host_core_commit` counts the bytes per scope
+    // before any of them are placed - so a placement that reaches either
+    // sentence is this host having placed something the rulebook refused.
+    place (id, bytes) {
+        const source = bytes instanceof Uint8Array
+            ? bytes : new Uint8Array (bytes);
+
+        if (! this.half) {
+            refuse (`this host placed resource ${id} in a space of no bytes: `
+                + `the module declares ${scopeMember (this.scope)} 0, which is `
+                + `a game that holds no ${scopeWord (this.scope)}-scoped `
+                + `resource at all, so the load should have failed at its `
+                + `commit.`);
+        }
+
+        const holding = this.held ();
+
+        if (holding + source.length > this.half) {
+            refuse (`this host placed resource ${id}, ${source.length} `
+                + `byte(s), in a space already holding ${holding} of `
+                + `${scopeMember (this.scope)} ${this.half}. A task whose `
+                + `loads pass that figure fails at its commit and places `
+                + `nothing.`);
+        }
+
+        this.queue.push ({ id, source, copied: 0, at: -1 });
+    }
+
+    // A resource given up, which leaves a hole nothing reuses until the next
+    // compaction. Freeing is the one thing a space does in no time at all.
+    free (id) { this.table.delete (id); }
+
+    // Whether there is placement or compaction work left.
+    pending () { return this.queue.length !== 0; }
+
+    // At most `chunk` bytes of it, and how many were actually done. A
+    // compaction in flight is the work; otherwise it is the oldest placement,
+    // which starts one if what is left of the active half is too short for it.
+    copy (chunk) {
+        const budget = chunk > 0 ? chunk : 1;
+
+        if (this.moving) { return this.move (budget); }
+
+        const placement = this.queue [0];
+
+        if (! placement) { return 0; }
+
+        if (placement.at < 0) {
+            const size = placement.source.length;
+
+            if (size > this.half - this.top) {
+                this.moving = { ids: [...this.table.keys ()], index: 0,
+                                top: 0, at: -1, copied: 0 };
+
+                return this.move (budget);
+            }
+
+            placement.at = this.base + this.active + this.top;
+            this.top += size;
+        }
+
+        const left = placement.source.length - placement.copied;
+        const take = left < budget ? left : budget;
+
+        this.view ().set (
+            placement.source.subarray (placement.copied,
+                placement.copied + take),
+            placement.at + placement.copied);
+
+        placement.copied += take;
+
+        if (placement.copied === placement.source.length) {
+            this.table.set (placement.id,
+                { address: placement.at, size: placement.source.length });
+
+            // And the arrived bytes let go of at the moment the last chunk
+            // lands, which is the one instant nothing needs them any more.
+            placement.source = null;
+            this.queue.shift ();
+        }
+
+        return take;
+    }
+
+    // One chunk of the compaction, which moves the live blocks into the other
+    // half in table order and then makes that half active.
+    move (budget) {
+        const move = this.moving;
+        const other = this.active ? 0 : this.half;
+
+        // The next block to move, skipping any freed since the compaction
+        // began: a hole is exactly what this is here to close.
+        while (move.at < 0 && move.index < move.ids.length) {
+            if (! this.table.has (move.ids [move.index])) {
+                move.index += 1;
+
+                continue;
+            }
+
+            move.at = this.base + other + move.top;
+            move.copied = 0;
+        }
+
+        if (move.at < 0) {
+            // Every live block has moved. The halves swap, and the placement
+            // that needed the compaction proceeds in the half they moved into.
+            this.switching (`make its other half active for resource `
+                + `${this.queue.length ? this.queue [0].id : 0}`);
+
+            this.active = other;
+            this.top = move.top;
+            this.moving = null;
+
+            return 0;
+        }
+
+        const id = move.ids [move.index];
+        const entry = this.table.get (id);
+
+        if (! entry) {
+            // Freed between two of its own chunks: the destination it had
+            // begun to take is given back, because a block is moved whole
+            // before the next one starts and nothing above it has been
+            // written.
+            move.index += 1;
+            move.at = -1;
+
+            return 0;
+        }
+
+        const left = entry.size - move.copied;
+        const take = left < budget ? left : budget;
+
+        this.view ().copyWithin (move.at + move.copied,
+            entry.address + move.copied, entry.address + move.copied + take);
+
+        move.copied += take;
+
+        if (move.copied === entry.size) {
+            this.switching (`move resource ${id} to its new address`);
+
+            this.table.set (id, { address: move.at, size: entry.size });
+
+            move.top += entry.size;
+            move.index += 1;
+            move.at = -1;
+        }
+
+        return take;
+    }
+
+    // The call this instance is inside, opened and closed where the instance
+    // arms and retires the record that makes a lock possible. Counted rather
+    // than flagged, because the two are composed by the same caller and a
+    // mismatched pair is a bug this class should not paper over.
+    openCall () { this.calls += 1; }
+
+    closeCall () { this.calls = this.calls > 0 ? this.calls - 1 : 0; }
+
+    // And the refusal that makes the two worth keeping: a table switch while a
+    // call is open, named by the resource it is about.
+    switching (what) {
+        if (! this.calls) { return; }
+
+        refuse (`this run's ${scopeMember (this.scope)} space would ${what} `
+            + `while a call is open. A lock taken in that call would answer `
+            + `one address before the switch and another after it, so a space `
+            + `switches its table between calls and never inside one.`);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session: mirrors what the native player does. Bump allocate above
 // __heap_base, call the exported factory, zero fill
 // the state block, then step once per frame.
@@ -2306,9 +3163,8 @@ class Session {
         //
         // Everything that used to be a JavaScript table here is in it now - the
         // ids, the slots, the two malformed spawns, the live count a crowded
-        // one is decided by, the validity of an id, the staging and both
-        // moments of a release - and `docs/host-core-rules.md` names each of
-        // those rows.
+        // one is decided by, the validity of an id, the staging, the store and
+        // its commit - and `docs/host-core-rules.md` names each of those rows.
         this.core = core;
 
         // Where a session's rules live inside that memory, set once the module
@@ -2322,7 +3178,7 @@ class Session {
         // why there are none, the reads it made on the way, and the name its
         // descriptor gave it. Keyed rather than indexed, because the core's
         // rows move whenever its table compacts and an index would name a
-        // different task after a release.
+        // different task after a retirement.
         //
         // `running` is this host's own knowledge and no rule at all: WHERE a
         // body executes is the embedder's business, so "is this body still in
@@ -2343,23 +3199,24 @@ class Session {
         //
         // It is kept beside the table rather than in it because it has to
         // outlive an entry. A run that ended by drawing its fallback and then
-        // released the id would otherwise have nothing left to say about the
-        // file it could not read - which is the one thing whoever is watching
+        // finalized the id would otherwise have nothing left to say about the
+        // file it could not load - which is the one thing whoever is watching
         // most wants to know. `resourceLine` is the reader.
         this.readLog = [];
 
-        // What an answer's bytes cost the arena, kept by SIZE CLASS and handed
-        // back. The runner's `bytes` points into the GAME's linear memory, and
-        // the output was computed in an instance the game cannot reach, so the
-        // bytes are copied across that boundary the way they are copied out of a
-        // forked child's mapping natively.
+        // What an answer's bytes and a resource's cost the arena, kept by SIZE
+        // CLASS and handed back. `finalize` copies an output out of the GAME's
+        // linear memory and a lock answers an address in it, and both were
+        // computed or loaded in an instance the game cannot reach, so the bytes
+        // are copied across that boundary the way they are copied out of a
+        // forked child natively.
         //
         // Reused because the bump allocator has no free and the header has a
         // lifetime: a block is dropped at the frame boundary after the game
-        // released its id, so it comes back here and the next answer of that
-        // class takes it. `release_task` munmaps at the same moment and for the
-        // same reason. Without it a game that spawns once a move would grow its
-        // own memory once a move, for the whole run.
+        // finalized its id, or after the store let its resource go, so it comes
+        // back here and the next block of that class takes it. Without it a game
+        // that spawns once a move would grow its own memory once a move, for
+        // the whole run.
         //
         // Rounded to powers of two rather than kept by exact size, which is a
         // backstop rather than the normal case: `output_size` is a constant on
@@ -2370,6 +3227,16 @@ class Session {
         // spare list per size for ever. Twenty-odd classes, at most 2x internal
         // waste, and invisible to the game either way.
         this.spare = new Map ();
+
+        // The resources this session's bodies loaded, by id: where this
+        // instance put each one - the space for a resource `step` may lock, a
+        // recycled block for every other - what that cost it, which calls may
+        // lock it, the file it came from and - for a resource `step` never
+        // locks - the bytes themselves, which a consumer is published and this
+        // instance never holds. Kept from the answer until the store's table
+        // stops naming the id, which is the one frame a renderer drawing
+        // behind is owed.
+        this.loaded = new Map ();
 
         this.module = new WebAssembly.Module (bytes);
         this.trampoline = trampoline;
@@ -2426,6 +3293,8 @@ class Session {
                 true);
             compose.setUint32 (this.loaderPtr + LAYOUT.loader.load,
                 this.slots.load, true);
+            compose.setUint32 (this.loaderPtr + LAYOUT.loader.unload,
+                this.slots.unload, true);
         }
 
         // The ring of runner records, one per slot, laid down once and armed
@@ -2447,28 +3316,34 @@ class Session {
         this.runnerRing = this.alloc (
             (this.constructSlot + 1) * LAYOUT.runner.stride);
 
-        // And the renderer's record, one rather than a ring. A renderer is
-        // never called inside another - `interface/game.h` says so of all three
-        // - so there is no second call to tell this one apart from, and one
-        // address is the whole of what a consumer has to be told.
+        // The ring of store records `step` is handed, one per slot of the
+        // runner's ring and armed with it: a store kept past its `step` names a
+        // slot the rulebook no longer calls live, exactly as a kept runner does.
+        // `construct` is handed none, so the ring has no slot past it.
+        this.storeRing = this.alloc (this.constructSlot * LAYOUT.store.bytes);
+
+        // And a renderer's, one rather than a ring. A renderer is never called
+        // inside another, so there is no second call to tell this one apart
+        // from.
         //
         // WHAT IS COMPOSED HERE IS NEVER HANDED TO ANYTHING. This session runs
         // no renderer: the picture is rendered in the render worker's instance
         // and the sound in the worklet's, and each writes its OWN record at this
-        // address in its own memory, over its own table's index. So what this
+        // address in its own memory, over its own table's indices. So what this
         // allocation really publishes is the address - `layout` below carries it
-        // - and what these two words are for is the refusal: a call reaching
-        // this record is a game that kept the address and spent it from a
-        // `step`, and `read` below answers every one of them the same way.
-        this.readerPtr = this.alloc (LAYOUT.reader.stride);
+        // - and what these words are for is the refusal a game that kept the
+        // address and spent it from a `step` earns.
+        this.renderStorePtr = this.alloc (LAYOUT.store.bytes);
 
         {
             const compose = this.view ();
 
-            compose.setUint32 (this.readerPtr + LAYOUT.reader.context, READER,
-                true);
-            compose.setUint32 (this.readerPtr + LAYOUT.reader.bytes,
-                this.slots.read, true);
+            compose.setUint32 (this.renderStorePtr + LAYOUT.store.context,
+                RENDERING, true);
+            compose.setUint32 (this.renderStorePtr + LAYOUT.store.lock,
+                this.slots.lock, true);
+            compose.setUint32 (this.renderStorePtr + LAYOUT.store.unlock,
+                this.slots.unlock, true);
         }
 
         // One game per module: the factory is a direct export, so there is no
@@ -2482,7 +3357,7 @@ class Session {
         //
         // `LAYOUT.game.bytes` is how much linear memory `factory` is handed. A
         // player one build behind a module hands it a block SHORTER than the
-        // struct the module writes: 52 bytes against 56 when `task_max` was
+        // struct the module writes: 52 bytes against 56 when `max_task_count` was
         // added, so four bytes land on whatever the arena put next. That is a
         // heap overwrite, it is the loudest and least predictable of the three,
         // and the `static_assert` that would warn about it fires in the GAME's
@@ -2599,7 +3474,9 @@ class Session {
         // game that reads by name; it is in the call so that this comparison
         // has something to see.
         this.construct = held (g.construct, 6, "construct");
-        this.step = held (g.step, 3, "step");
+        // Four since `step` was handed a store, so a module built against the
+        // header before it is refused naming three and four before a frame.
+        this.step = held (g.step, 4, "step");
 
         // NEVER CALLED HERE, and kept for exactly what the sound's twin below
         // is kept for. The picture is rendered in the render worker's own
@@ -2657,9 +3534,16 @@ class Session {
         // the table below is sized from it. Read here beside `controls`
         // and `background` because it is the same kind of thing - a
         // declaration about the module, read once at load.
-        this.taskMax = view.getUint32 (gamePtr + g.taskMax, true);
+        this.maxTaskCount = view.getUint32 (gamePtr + g.maxTaskCount, true);
 
-        // What this game persists, read here beside `taskMax` because it is the
+        // And the bytes one of those tasks' bodies may ask to work in, read
+        // here for the reason above and spent at every spawn: a descriptor
+        // asking past it ends the run, on this host and on the other two, since
+        // both figures are the module's own.
+        this.maxScratchBytes =
+            view.getUint32 (gamePtr + g.maxScratchBytes, true);
+
+        // What this game persists, read here beside `maxTaskCount` because it is the
         // same kind of thing: a declaration about the module, read once at
         // load. Zero is a game that keeps nothing between runs, and `construct`
         // is then handed null - which is the spelling `interface/game.h` gives
@@ -2686,10 +3570,10 @@ class Session {
         // that declared more than a host carries. The pair check beside it
         // costs one comparison and turns a saving game that would silently
         // persist nothing into a page that says which half is missing.
-        if (this.saveSize > core.figure (CORE.figure.saveMax)) {
+        if (this.saveSize > core.figure (CORE.figure.maxSaveBytes)) {
             refuse (`this module declares a save_size of ${this.saveSize}, and `
                 + `a host carries at most `
-                + `${core.figure (CORE.figure.saveMax)} bytes of save state.`);
+                + `${core.figure (CORE.figure.maxSaveBytes)} bytes of save state.`);
         }
 
         if ((this.saveSize !== 0) !== (this.saveFn !== null)) {
@@ -2698,6 +3582,18 @@ class Session {
                 + `${this.saveFn ? "set" : "null"}, and the two are declared `
                 + `together or not at all.`);
         }
+
+        // The frame this game draws, refused in the save pair's two ways and in
+        // the words `console.c` and `goldenhash.js` refuse it in: half a
+        // declaration, and a figure past what a pointer's coordinate can name.
+        // Both zero is the console's own. Kept, resolved, because the pointer
+        // is clamped to it and the framebuffer below is allocated at it.
+        const frame = declaredFrame (view, gamePtr);
+
+        if (frame.refusal) { refuse (frame.refusal); }
+
+        this.frameWidth = frame.width;
+        this.frameHeight = frame.height;
 
         // What each renderer is handed, read here beside `saveSize` because it
         // is the same kind of thing: a declaration about the module, read once
@@ -2754,15 +3650,34 @@ class Session {
         // And the session of rules that declaration sizes, laid out in the
         // core's own memory the moment the number is known - exactly as a host
         // allocates `Game.size` from what a game declared, one memory along.
-        this.host = core.begin (this.taskMax);
+        this.host = core.begin (this.maxTaskCount, this.maxScratchBytes);
 
         // The entries that table holds, which is the rulebook's own answer
         // rather than an arithmetic this file repeats: it derives the figure
-        // from the worst moment a conforming game can reach - `task_max` live
-        // ids, plus the answered ids released inside one frame - so a page that
+        // from the worst moment a conforming game can reach - `max_task_count` live
+        // ids, plus the answered ids finalized inside one frame - so a page that
         // filled this many rows is playing a game `inspector` could not replay
         // either.
         this.taskSlots = core.slots (this.host);
+
+        // How many resources this game may hold at once, read beside `maxTaskCount`
+        // because it is the same declaration one noun over, and the store it
+        // sizes laid out in the core's memory the same moment the table is.
+        this.maxResourceCount = view.getUint32 (gamePtr + g.maxResourceCount, true);
+
+        // And how many BYTES of them each scope's calls may hold, which is the
+        // same declaration one noun over again. Read as one object because the
+        // three travel together everywhere they travel at all - into the store
+        // here, and across to a consumer in its layout.
+        this.maxResourceBytes = {
+            game: view.getUint32 (gamePtr + g.maxGameResourceBytes, true),
+            video: view.getUint32 (gamePtr + g.maxVideoResourceBytes, true),
+            audio: view.getUint32 (gamePtr + g.maxAudioResourceBytes, true),
+        };
+
+        this.resourceStore = core.beginResources (this.maxResourceCount,
+            this.maxTaskCount, this.maxResourceBytes);
+        this.runner.maxResourceCount = this.maxResourceCount;
 
         // A need outside the enumeration is this mirror reading the wrong four
         // bytes, which is the hazard `LAYOUT` carries and the one failure that
@@ -2864,11 +3779,14 @@ class Session {
         // `render_audio` in the worklet's. Both are allocated HERE all the same,
         // and that is the point rather than a leftover - a consumer lays no
         // arena down, so what makes its scratch land somewhere that overlaps no
-        // state block and no task block is that this arena chose the address and
-        // published it. Two 57,600- and 1,600-byte holes in the simulation's
-        // memory buy every consumer a place to render into, and this session
-        // never spends either.
-        this.videoPtr = this.alloc (FRAME_WIDTH * FRAME_HEIGHT);
+        // state block and no output is that this arena chose the address and
+        // published it. A frame at the size the module declared, head and
+        // pixels, and a 1,600-byte block of samples in the simulation's memory
+        // buy every consumer a place to render into, and this session never
+        // spends either - the head included, which the consumer writes in its
+        // own memory.
+        this.videoPtr = this.alloc (LAYOUT.frame.pixels
+            + this.frameWidth * this.frameHeight);
         this.samplesPtr = this.alloc (SAMPLES_PER_FRAME * 2);
 
         // The two descriptions, taken after every step and handed to the
@@ -2879,6 +3797,24 @@ class Session {
 
         this.audioStatePtr = this.audioStateSize
             ? this.alloc (this.audioStateSize) : NOTHING;
+
+        // And the space this instance holds the resources `step` may lock in,
+        // reserved here and never grown for a resource again. Twice
+        // `max_game_resource_bytes`, because a space is two halves and a block
+        // is moved into free bytes rather than over bytes a call is reading.
+        //
+        // LAST OF THE PROLOGUE, after every hole a consumer is told about, so
+        // that reserving one moves none of those addresses. A game that
+        // declares no game-scoped bytes reserves nothing at all and its arena
+        // is byte for byte what it was.
+        //
+        // The region is NOT TOUCHED here. Whether a first write into freshly
+        // grown pages costs more than a warm one, and whether touching a page
+        // each at open removes it, is R2 of the plan's phase 0 and is the
+        // owner's reading; phase 7 acts on it.
+        this.space = ResourceSpace.reserve (this.memory,
+            (bytes) => this.alloc (bytes), this.maxResourceBytes.game,
+            CORE.scope.game);
 
         // The `task` and `taskfail` half of a mark, written on the frame an
         // answer becomes visible and by id, because that is the whole of what
@@ -2909,10 +3845,23 @@ class Session {
         // derived from the very pairs beside it, so this is where a game asks
         // for it - and the record is armed, spent and retired exactly as a
         // frame's is, because it is the same record under the same rule.
-        this.construct (this.statePtr, seed, this.savedPtr, this.argsPtr,
-            this.argCount, this.armConstruct ());
+        const state = this.construct (this.statePtr, seed, this.savedPtr,
+            this.argsPtr, this.argCount, this.armConstruct ()) >>> 0;
 
         this.retireConstruct ();
+
+        // And the state the game confers by returning it, which is the block
+        // it was handed and can be no other address: the struct is at the head
+        // of the block, so the only pointer `construct` has to answer with is
+        // the one it was given. Decided here, from the call alone, in the same
+        // words `console.c` and `goldenhash.js` decide it in - a module that
+        // answers with anything else is malformed, and every address in this
+        // session after it would be the host's guess rather than the game's.
+        if (state !== this.statePtr) {
+            refuse ("construct returned a pointer that is not the state block "
+                + "it was handed; the state is that block under the game's own "
+                + "type and can be no other address");
+        }
 
         // Before any frame, so that a host drawing before its first step is
         // handed a description rather than the zeros a fresh hole begins with.
@@ -2991,7 +3940,7 @@ class Session {
     buildArguments () {
         // Where the pairs and their strings ended up, as one span, or null for
         // a run that supplied none. A consumer mirrors it once at session
-        // start, because `interface/game.h:34-44` makes the argument storage
+        // start, because `interface/game.h:35-47` makes the argument storage
         // one of the six kinds of memory a state may point into and the header
         // gives it the whole run.
         this.argsRegion = null;
@@ -3133,24 +4082,23 @@ class Session {
     // know what it is being held to before they can see whether the calls below
     // are in the right order:
     //
-    // - **An id is live from the spawn until the release**, and is one of the
-    //   game's `task_max` slots until the frame boundary that settles the
-    //   release. An answered id counts and so does a failed one: polling has no
+    // - **An id is live from the spawn until the `finalize`**, and is one of
+    //   the game's `max_task_count` slots until the frame boundary after it. An
+    //   answered id counts and so does a failed one: polling has no
     //   you-were-told moment, so nothing but the game ends an id.
-    // - **A release takes effect at the frame boundary, WHOLE.** The slot and
-    //   the bytes are let go of at one moment, cancels included - so the block
-    //   a `step` released stays readable for the rest of that frame, because
-    //   both renderers run after the step and may not disagree with it about
-    //   what is on screen, and a game at its limit that releases and spawns in
+    // - **A pending `finalize` is a cancel**, and a succeeded one copies the
+    //   output into the game's own bytes once. The slot and the block go at
+    //   the next boundary, so a game at its limit that finalizes and spawns in
     //   its place inside one `step` is answered 0 and spawns next frame.
-    // - **`done` flips at a frame boundary and never inside a call**, so what
-    //   the runner says about an id is the same throughout one `step`. Nothing
-    //   is held back and nothing is ordered - per-id status has no order to pin.
+    // - **`status` changes at a frame boundary and never inside a call**, and
+    //   so does which resources the store holds: a task's loads and unloads
+    //   settle at the boundary that shows its answer, in task id order.
     // - **A spawn with no slot answers 0**, mints nothing and touches nothing,
-    //   which is a condition a game acts on. A MALFORMED spawn and an INVALID id
-    //   end the run instead, and each of those sentences is byte for byte the
-    //   console's and the golden's: `products/host-core` answers the verdict and
-    //   the figures, and `docs/host-core-rules.md` carries the templates.
+    //   which is a condition a game acts on. A MALFORMED spawn, an INVALID id
+    //   and a lock the store refuses end the run instead, and each of those
+    //   sentences is byte for byte the console's and the golden's:
+    //   `products/host-core` answers the verdict and the figures, and
+    //   `docs/host-core-rules.md` carries the templates.
     //
     // Every view below is built where it is used and thrown away again, which
     // is the same rule `frame` and `palette` follow and for the same reason:
@@ -3173,7 +4121,7 @@ class Session {
 
     // Every row of the rulebook's table, in id order, which is spawn order:
     // ids are monotonic, entries are appended in order, and the compaction a
-    // release and a retirement do preserves it.
+    // retirement does preserves it.
     rows () {
         const rows = [];
 
@@ -3202,12 +4150,13 @@ class Session {
     }
 
     // The table as `console_tasks` reports it: everything the game has not
-    // released, in id order. An ANSWERED entry stays until the game releases the
-    // id, whether it answered with bytes or with nothing: a game that has not
-    // polled has not been told, so nothing but the game ends an id.
+    // finalized, in id order. An ANSWERED entry stays until the game finalizes
+    // the id, whether it succeeded or failed: a game that has not polled has not
+    // been told, so nothing but the game ends an id.
     //
-    // That is what makes it the leak report. A row still `resident` long after
-    // its `finished` frame is a block the game is holding and nothing warns.
+    // That is what makes it half of the leak report. A row still `succeeded`
+    // long after its `finished` frame is a slot the game is holding and nothing
+    // warns.
     //
     // The two halves are joined here and only here: the numbers off the
     // rulebook's row, the name off this host's own record of the spawn, and
@@ -3227,22 +4176,17 @@ class Session {
         });
     }
 
-    // The six functions this session's records point at, as the closures the
-    // trampoline forwards to - and `load` is not one of the services. It is
-    // answered here to REFUSE, because a parameter list names what its callee
-    // can do: a body reads files and cannot spawn, a `step` spawns and releases
-    // and cannot read a file, a renderer names a task's bytes and can do
-    // nothing else, and the copy that serves a read is the one `runTaskBody`
-    // binds against the instance the body runs in.
+    // The seven functions this session's records point at, as the closures the
+    // trampoline forwards to - and `load` and `unload` are not services. They
+    // are answered here to REFUSE, because a parameter list names what its
+    // callee can do: a body loads files and cannot spawn, a `step` spawns and
+    // locks and cannot load a file, and the copy that serves a load is the one
+    // `runTaskBody` binds against the instance the body runs in.
     //
-    // All six are installed whether the game spends any of them or not, and
-    // the reason is no longer about import sections: the six wrappers land at
-    // fixed table indices in every instance of one module, so a session that
-    // installed five and a body's instance that installed six would disagree
-    // about what a number in a record means. The console's `hermit` fixture
-    // calls no member of the runner it is handed and gets the table's slots
-    // exactly as `borrower` does, which is what "permission is not provision"
-    // became when the imports went.
+    // All seven are installed whether the game spends any of them or not: the
+    // seven wrappers land at fixed table indices in every instance of one
+    // module, so a session that installed six and a body's instance that
+    // installed seven would disagree about what a number in a record means.
     services () {
         // Whether the runner's context is this frame's. A game passes back what
         // the record it was handed carries, so a wrong one is a game that
@@ -3281,28 +4225,40 @@ class Session {
         // And the id, held to the one thing every host must agree about it. The
         // VERDICT and the figure are the rulebook's - the table is the oracle,
         // and past the counter, absent below it and 0 are its three answers -
-        // and the three sentences are this file's, byte for byte the console's
-        // and the golden's. `docs/host-core-rules.md` carries the templates.
-        const live = (id, called) => {
-            const verdict = this.core.checkId (this.host, id);
+        // and the sentence is `askRefusal`'s, byte for byte the console's and
+        // the golden's. `docs/host-core-rules.md` carries the templates.
+        const live = (verdict, id, called) => {
+            if (verdict === CORE.ask.live) { return true; }
 
-            if (verdict === CORE.id.live) { return true; }
+            refuse (askRefusal (verdict, id >>> 0, called,
+                this.core.issued (this.host)));
+        };
 
-            if (verdict === CORE.id.none) {
-                refuse (`${called} was called with id 0, which is *no task* `
-                    + `rather than a task; a polling site guards on the id it `
-                    + `kept`);
+        // Whether a store's context is this frame's `step`. A store is armed on
+        // the slot this frame's runner was, so the rulebook's stamps answer for
+        // both records. A renderer's store reaching here is a game that kept
+        // that address and spent it from a `step`, since this instance renders
+        // nothing.
+        const storeArmed = (context) => {
+            if (! context) { return false; }
+
+            if ((context >>> 0) === RENDERING) {
+                refuse (`${this.name} locked a resource through a store from `
+                    + `outside the renderer it was handed to. A store is valid `
+                    + `for one call and no longer, and the instance that steps `
+                    + `renders nothing.`);
             }
 
-            if (verdict === CORE.id.unissued) {
-                refuse (`${called} was called with id ${id}, which this run has `
-                    + `never issued; ${this.core.issued (this.host)} id(s) have `
-                    + `been issued so far`);
+            const slot = (context - STORE) >>> 0;
+            const held = this.core.checkRunner (this.host, slot);
+
+            if (held.verdict === CORE.context.live
+                && slot !== this.constructSlot) {
+                return true;
             }
 
-            refuse (`${called} was called with id ${id}, which the game has `
-                + `already released; a released id names nothing, and release `
-                + `pairs with clearing the id it took`);
+            refuse (`the store handed to frame ${held.armed} was used after `
+                + `that step returned; it is valid for one call and no longer.`);
         };
 
         return {
@@ -3326,10 +4282,19 @@ class Session {
             load: (context) => {
                 if (! context) { return 0; }
 
-                refuse (`${this.name} read a resource through a loader from `
+                refuse (`${this.name} loaded a resource through a loader from `
                     + `outside the body it was handed to. A loader is valid for `
                     + `one body call and no longer, and a body's own instance `
                     + `is gone by the time its answer reaches a step.`);
+            },
+
+            unload: (context) => {
+                if (! context) { return; }
+
+                refuse (`${this.name} unloaded a resource through a loader `
+                    + `from outside the body it was handed to. A loader is `
+                    + `valid for one body call and no longer, and a body's own `
+                    + `instance is gone by the time its answer reaches a step.`);
             },
 
             spawn: (context, descriptor, input) => {
@@ -3383,6 +4348,12 @@ class Session {
                         + `reads`);
                 }
 
+                if (answer.verdict === CORE.verdict.greedy) {
+                    refuse (`task ${task.name} asks for `
+                        + `${answer.scratchSize} byte(s) of scratch, past its `
+                        + `max_scratch_bytes of ${answer.maxScratchBytes}`);
+                }
+
                 // Derived to be unreachable by a conforming game and kept
                 // anyway: a host with no entry left cannot record the spawn at
                 // all, and saying so beats inventing a limit the other host does
@@ -3392,7 +4363,7 @@ class Session {
                 if (answer.verdict === CORE.verdict.full) {
                     refuse (`spawn is past the ${this.taskSlots} entries a `
                         + `host's table holds at once, which is derived from `
-                        + `task_max and is unreachable by a conforming game`);
+                        + `max_task_count and is unreachable by a conforming game`);
                 }
 
                 // And the one CONDITION, which is not a message at all: the game
@@ -3401,6 +4372,41 @@ class Session {
                 // what it is told. A game at its limit retries next frame for
                 // free.
                 if (answer.verdict === CORE.verdict.crowded) { return 0; }
+
+                // THE ONE REFUSAL THE CORE CANNOT SEE, and the last thing
+                // checked before anything is placed for this body. A
+                // `Game_Task_Body` reaches a host as an index in a descriptor
+                // rather than as a member of `Game`, so its arity is unreadable
+                // until a spawn names it - and then it is readable exactly as
+                // `step`'s is at load, off the wasm function's own JavaScript
+                // `length`. Called through the wrong prototype it would trap on
+                // the `call_indirect` signature instead, which fails the task
+                // and says nothing about why.
+                //
+                // After the core's verdicts rather than before them, so that
+                // every verdict the three hosts share is still decided by the
+                // rulebook and in the rulebook's order; the console cannot read
+                // an arity at all, so this one is the page's alone and there is
+                // no parity case for it.
+                // An index past the table's bound throws here, and that is a
+                // failed TASK rather than a refused run - the answer the native
+                // host gives a function pointer that is not one - so it is left
+                // to `runTaskBody`, which already reports it that way.
+                let body = null;
+
+                try { body = this.table.get (task.body); }
+                catch (error) { body = null; }
+
+                if (body && typeof body.length === "number"
+                    && body.length !== 4) {
+                    refuse (`this module's \`${task.name}\` body takes `
+                        + `${body.length} argument(s) where this page calls it `
+                        + `with 4. Arity is silent in both directions in `
+                        + `JavaScript, so a page and a module from two `
+                        + `different builds would otherwise hand a body `
+                        + `plausible values in the wrong slots rather than `
+                        + `failing.`);
+                }
 
                 const id = answer.id;
 
@@ -3416,12 +4422,12 @@ class Session {
                 this.runner.run (id, task, bytes).then (answered => {
                     const work = this.work.get (id);
 
-                    // Released while the body was in the air, which a
-                    // runner's `release` makes a cancel: the id it took is
-                    // never answered, and this is where that promise is kept
-                    // against an answer that arrived anyway. A release struck
-                    // this host's half of the entry as it struck the rulebook's,
-                    // so there being nothing here is the whole of the test.
+                    // Finalized while the body was in the air, which makes it a
+                    // cancel: the id it took is never answered, and this is
+                    // where that promise is kept against an answer that arrived
+                    // anyway. A `finalize` struck this host's half of the entry
+                    // as it struck the rulebook's, so there being nothing here
+                    // is the whole of the test.
                     if (! work || ! work.running) { return; }
 
                     work.running = false;
@@ -3431,11 +4437,9 @@ class Session {
                     // THE BLOCK IS TAKEN HERE rather than at the boundary, and
                     // that is what the two memories cost: the address is what
                     // the rulebook stores beside the id and hands back through
-                    // `bytes`, so it has to exist by the time the answer is
-                    // recorded. Nothing a game can see moves -
-                    // the bytes are the same bytes at the same alignment, and
-                    // an id released before its answer has its block dropped by
-                    // the cancel rather than never taken.
+                    // `host_core_finalize`, so it has to exist by the time the
+                    // answer is recorded. An id finalized before its answer
+                    // never reaches this line at all.
                     let at = 0, span = 0;
 
                     if (answered.output) {
@@ -3459,6 +4463,13 @@ class Session {
                     // page's.
                     this.core.answer (this.host, id, !! answered.output, at,
                         span);
+
+                    // And what the body loaded and unloaded, with the answer
+                    // and before it is staged, which is the order the rulebook
+                    // holds them in. A body that did not finish loaded nothing
+                    // anybody will ever commit.
+                    if (answered.output) { this.answerLoads (id, answered); }
+
                     this.core.stage (this.host, id, false);
 
                     this.onStaged ();
@@ -3467,102 +4478,146 @@ class Session {
                 return id;
             },
 
-            // The two questions a game asks about an id, which are the whole of
-            // what polling is: a level sampled per frame rather than an edge
-            // handed over once.
+            // The question a game asks about an id, which is the whole of what
+            // polling is: a level sampled per frame rather than an edge handed
+            // over once.
             //
-            // Both ask the same two guards and in the same order - is this
+            // It asks the two guards in the same order `finalize` does - is this
             // record this call's, and is this id one the run issued and has not
-            // released - because a game reaching into a session between frames
-            // and a game asking about a task it let go are two bugs, and each is
+            // finalized - because a game reaching into a session between frames
+            // and a game asking about a task it ended are two bugs, and each is
             // loud on every host or on none.
-            done: (context, id) => {
+            status: (context, id) => {
                 if (! armed (context)) { return 0; }
-                if (! live (id, "done")) { return 0; }
 
-                return this.core.done (this.host, id) ? 1 : 0;
+                const answer = this.core.status (this.host, id);
+
+                if (! live (answer.verdict, id, "status")) { return 0; }
+
+                return answer.status;
             },
 
-            bytes: (context, id) => {
-                if (! armed (context)) { return 0; }
-                if (! live (id, "bytes")) { return 0; }
-
-                // The address the arena handed out, in the GAME's own memory:
-                // the rulebook stored it as an opaque number and never
-                // dereferenced it, and this is where it goes back to being a
-                // pointer the game reads.
-                return this.core.bytes (this.host, id);
-            },
-
-            // The reader's `bytes`, which is the whole of what a RENDERER may
-            // ask this host for. The same sample `bytes` above answers, with
-            // the length written beside it: a renderer holds no descriptor, so
-            // `output_size` travels with the block rather than being
-            // remembered.
-            //
-            // `size` is written before anything else, so every path out of here
-            // leaves a caller a length it can read without first branching on
-            // the pointer. A null `size` is a game passing something that is
-            // not the out-parameter the header declares, and is left alone
-            // rather than written through.
-            read: (context, id, size) => {
-                const put = (span) => {
-                    if (! size) { return; }
-
-                    this.view ().setUint32 (size, span >>> 0, true);
-                };
-
-                put (0);
-
-                // A null context is not a stale one and is not reported, for
-                // the reason a null runner's is not: there is no session behind
-                // one to write a fault into.
-                if (! context) { return 0; }
-
-                // ALWAYS, because this session runs no renderer: the picture
-                // is drawn in the render worker's instance and the sound in the
-                // worklet's, and each answers its own reader out of the blocks
-                // it was handed. So a call that reaches here is a game that kept
-                // the address and spent it from a `step`, which is the one thing
-                // this record can still be used for and is refused rather than
-                // served.
-                refuse (`${this.name} named a task's bytes through a `
-                    + `reader from outside the renderer it was handed to. A `
-                    + `reader is valid for one call and no longer, and the `
-                    + `instance that steps is handed none at all.`);
-            },
-
-            release: (context, id) => {
+            // The end of a task, whatever its status. What a `finalize` MEANS
+            // is the rulebook's: the id names nothing from this call, and the
+            // slot and the output go at the next boundary. What is left here is
+            // the copy out of the arena into the game's own bytes, and the
+            // cancel a pending task earns.
+            finalize: (context, id, output) => {
                 if (! armed (context)) { return; }
-                if (! live (id, "release")) { return; }
 
-                // What a release MEANS is the rulebook's, and it is ONE
-                // MOMENT: the entry is marked here and settles at the next
-                // frame boundary, slot and bytes together, a cancel included.
-                // So the block stays readable for the rest of this frame -
-                // both renderers run after the step and `game.h` promises they
-                // cannot disagree with it about what is on screen - and the id
-                // stops being one the game may ask about from this call, which
-                // is the mark rather than the sweep.
-                this.core.release (this.host, id);
+                const answer = this.core.finalize (this.host, id);
 
-                // Unconditional, and it can be. A worker is one task's, and
-                // `TaskRunner.release` finds nothing for a task that has
-                // already answered, for a refusal that never had a thread, and
-                // for an id that was never issued. Asking the table which of
-                // those it was would be this file deciding what a release
-                // means, which is the sentence that just moved.
-                this.runner.release (id);
+                if (! live (answer.verdict, id, "finalize")) { return; }
+
+                if (answer.status === CORE.status.succeeded && output
+                    && answer.outputSize) {
+                    new Uint8Array (this.memory.buffer).copyWithin (output >>> 0,
+                        answer.block, answer.block + answer.outputSize);
+                }
+
+                // A worker is one task's, and `TaskRunner.cancel` finds nothing
+                // for a task that has already answered - so this is only ever a
+                // thread stopped where a body is still running.
+                if (answer.status === CORE.status.pending) {
+                    this.runner.cancel (id);
+                }
 
                 this.work.delete (id);
+            },
 
-                // No `reclaimBlocks` here, and that is the rule showing
-                // through rather than an omission: no row loses its block at a
-                // release any more, so the reconciliation would find nothing.
-                // `retireFrame` is the one moment this arena takes anything
-                // back.
+            // A lock from `step`, answered out of this session's store. The
+            // answer is a `Game_Data` written at the hidden pointer a wasm32
+            // struct return goes through, and it is written as zeros first so
+            // that no path out leaves the caller's bytes as they were.
+            lock: (answerAt, context, id) => {
+                this.writeData (answerAt, 0, 0);
+
+                if (! storeArmed (context)) { return; }
+
+                const answer = this.core.lock (this.resourceStore, id);
+
+                if (answer.verdict !== CORE.lock.taken) {
+                    refuse (lockRefusal (answer, id >>> 0, CORE.scope.game));
+                }
+
+                this.writeData (answerAt, answer.bytes, answer.size);
+            },
+
+            unlock: (context, id) => {
+                if (! storeArmed (context)) { return; }
+
+                if (this.core.unlock (this.resourceStore, id)
+                    !== CORE.unlock.taken) {
+                    refuse (unlockRefusal (id >>> 0, CORE.scope.game));
+                }
             },
         };
+    }
+
+    // A `Game_Data` at the address a wasm32 struct return goes through.
+    writeData (at, bytes, size) {
+        if (! at) { return; }
+
+        const view = this.view ();
+
+        view.setUint32 ((at >>> 0) + LAYOUT.data.bytes, bytes >>> 0, true);
+        view.setUint32 ((at >>> 0) + LAYOUT.data.size, size >>> 0, true);
+    }
+
+    // What a body loaded, placed where its scope says and recorded with its
+    // answer. Every load takes an address in this arena whatever its scope, so
+    // that a consumer can put the bytes at the same address in its own memory;
+    // only a resource `step` may lock LANDS here, which is P6 of
+    // `docs/archived/resource-store-plan.md` read from the simulation's side.
+    answerLoads (id, answered) {
+        const loads = (answered.loads || []).map ((load, ordinal) => {
+            const game = (load.scope & CORE.scope.game) !== 0;
+            const resource = this.core.resourceId (id, ordinal);
+
+            const block = game ? this.placeResource (resource, load.bytes)
+                : this.takeResource (load.bytes);
+
+            this.loaded.set (resource, {
+                task: id, address: block.at, span: block.span,
+                size: load.bytes.length, scope: load.scope, file: load.file,
+                bytes: game ? null : load.bytes });
+
+            return { bytes: block.at, span: block.span,
+                     size: load.bytes.length, scope: load.scope };
+        });
+
+        this.core.answerResources (this.host, this.resourceStore, id, loads,
+            answered.unloads || []);
+    }
+
+    // A resource `step` may lock, in the space this instance reserved for them
+    // at open. Its address is the space's, which is what the store keeps beside
+    // the id and what a consumer is published.
+    //
+    // DRIVEN TO COMPLETION HERE, synchronously, which is exactly where the copy
+    // happened before the space existed: an answer's frame is the recording's,
+    // and this phase of `docs/resource-space-plan.md` moves no answer. What
+    // spends these two primitives a gap at a time, against a deadline, is the
+    // plan's phase 7 - the primitives are the same two either way.
+    placeResource (id, bytes) {
+        this.space.place (id, bytes);
+
+        while (this.space.pending ()) { this.space.copy (PLACEMENT_CHUNK); }
+
+        return { at: this.space.addressOf (id), span: bytes.length };
+    }
+
+    // And a block of the arena for a resource only a RENDERER may lock, out of
+    // the same size classes an answer's output takes. Never written: the bytes
+    // go to whoever locks them and nothing in this instance ever reads the
+    // block, which holds whatever it held. What it buys is the address, so that
+    // a consumer can put those bytes at the same address in its own memory.
+    takeResource (bytes) {
+        const span = sizeClass (bytes.length || 1);
+        const free = this.spare.get (span);
+        const at = free && free.length ? free.pop () : this.alloc (span);
+
+        return { at, span };
     }
 
     // This frame's runner record, composed and armed, and the address `step` is
@@ -3584,7 +4639,44 @@ class Session {
         // rulebook's. What is composed here is the RECORD over that slot, which
         // is per-target and cannot be shared: a native record holds addresses
         // and this one holds table indices.
-        return this.composeRunner (this.core.armRunner (this.host));
+        this.armedSlot = this.core.armRunner (this.host);
+
+        return this.composeRunner (this.armedSlot);
+    }
+
+    // And the store `step` is handed, on the slot this frame's runner was armed
+    // on and composed whole the same way. The call is opened here and closed
+    // by `retireStore`, which is the whole of what makes a lock scoped to
+    // `step` and balanced within it.
+    armStore () {
+        const slot = this.armedSlot;
+        const at = this.storeRing + slot * LAYOUT.store.bytes;
+        const compose = this.view ();
+
+        compose.setUint32 (at + LAYOUT.store.context, (STORE + slot) >>> 0,
+            true);
+        compose.setUint32 (at + LAYOUT.store.lock, this.slots.lock, true);
+        compose.setUint32 (at + LAYOUT.store.unlock, this.slots.unlock, true);
+
+        this.core.openCall (this.resourceStore, CORE.scope.game);
+
+        // And the space told the same thing, because it is the one that has to
+        // refuse a table switch while this call is open: a lock taken inside it
+        // answers an address, and a block moved under it would give that lock
+        // two.
+        this.space.openCall ();
+
+        return at;
+    }
+
+    retireStore () {
+        this.space.closeCall ();
+
+        const closed = this.core.closeCall (this.resourceStore);
+
+        if (closed.verdict === CORE.close.holding) {
+            refuse (holdingRefusal (closed));
+        }
     }
 
     // And `construct`'s own, on a slot outside the ring. One writer for both,
@@ -3605,9 +4697,8 @@ class Session {
         compose.setUint32 (at + LAYOUT.runner.context, (RUNNER + slot) >>> 0,
             true);
         compose.setUint32 (at + LAYOUT.runner.spawn, this.slots.spawn, true);
-        compose.setUint32 (at + LAYOUT.runner.done, this.slots.done, true);
-        compose.setUint32 (at + LAYOUT.runner.bytes, this.slots.bytes, true);
-        compose.setUint32 (at + LAYOUT.runner.release, this.slots.release,
+        compose.setUint32 (at + LAYOUT.runner.status, this.slots.status, true);
+        compose.setUint32 (at + LAYOUT.runner.finalize, this.slots.finalize,
             true);
 
         return at;
@@ -3640,8 +4731,8 @@ class Session {
             name: namePtr ? this.string (namePtr) : "",
             body: view.getUint32 (at + layout.body, true),
             inputSize: view.getUint32 (at + layout.inputSize, true),
-            scratchSize: view.getUint32 (at + layout.scratchSize, true),
             outputSize: view.getUint32 (at + layout.outputSize, true),
+            scratchSize: view.getUint32 (at + layout.scratchSize, true),
         };
     }
 
@@ -3670,7 +4761,7 @@ class Session {
         return { at, span };
     }
 
-    releaseOutput (at, span) {
+    recycleOutput (at, span) {
         const free = this.spare.get (span);
 
         if (free) { free.push (at); }
@@ -3679,24 +4770,20 @@ class Session {
 
     // The arena, reconciled against the table the rulebook left behind.
     //
-    // `Host_Core_Blocks` is how a host gives a task's bytes back and this one
-    // cannot fill one in - `HostCore.release` says why - so what is freed here
-    // is every address this arena is holding that no row of the table names any
+    // `Host_Core_Blocks` is how a host gives bytes back and this one cannot fill
+    // one in - `HostCore.retire` says why - so what is freed here is every
+    // address this arena is holding that no row of either table names any
     // more. It decides NOTHING: which entries end, and when, is read off the
-    // table rather than recomputed, so the rule stays in one place and this
-    // stays bookkeeping. There is ONE moment now - a release marks the entry
-    // and the frame boundary takes its slot and its bytes together - so
-    // `retireFrame` is the one caller, where there used to be two. What it
-    // finds is both kinds of address the table has stopped naming: a released
-    // entry the sweep has just dropped, and the block behind an answer of
-    // nothing, which `host_core_show` drops a frame earlier. `munmap` is what
-    // the console does at exactly those moments.
+    // tables rather than recomputed, so the rule stays in one place and this
+    // stays bookkeeping. `retireFrame` is the one caller, and what it finds is
+    // a finalized entry the sweep has just dropped, the block behind an answer
+    // of nothing, and a resource the store has let go of. `munmap` is what the
+    // console does at exactly those moments.
     reclaimBlocks () {
-        if (! this.blocks.size) { return; }
-
+        const rows = this.rows ();
         const held = new Set ();
 
-        for (const row of this.rows ()) {
+        for (const row of rows) {
             if (row.block) { held.add (row.block); }
         }
 
@@ -3704,19 +4791,43 @@ class Session {
             if (held.has (at)) { continue; }
 
             this.blocks.delete (at);
-            this.releaseOutput (at, span);
+            this.recycleOutput (at, span);
+        }
+
+        // And a resource's block, which stays while the store's table names its
+        // id - live, or dead and still owed the frame after its unload - or
+        // while its task's answer is staged and not yet committed. Anything
+        // else is a load the rulebook gave back: refused at its commit,
+        // cancelled with its task, or unloaded by the body that loaded it.
+        if (! this.loaded.size) { return; }
+
+        const kept = new Set (this.resources ().map (row => row.id));
+        const waiting = new Set (rows.filter (row => row.staged && ! row.dead)
+            .map (row => row.id));
+
+        for (const [id, entry] of [...this.loaded]) {
+            if (kept.has (id) || waiting.has (entry.task)) { continue; }
+
+            this.loaded.delete (id);
+
+            // A resource `step` may lock is in the space, and what it leaves
+            // there is a hole the next compaction closes; every other one goes
+            // back to the recycler it was taken from.
+            if (entry.scope & CORE.scope.game) { this.space.free (id); }
+            else { this.recycleOutput (entry.address, entry.span); }
         }
     }
 
     // Last frame's edges, retired before this frame's are published.
     //
-    // A released block goes at the end of the frame its release happened on,
-    // and nothing else does: an answered id is the game's until it releases it,
+    // A finalized block goes at the end of the frame its finalize happened on,
+    // and nothing else does: an answered id is the game's until its finalize,
     // whether it answered with bytes or with nothing. The rule is
     // `host_core_retire` and what is left here is the arena and this host's own
     // half of an entry the rulebook has finished with.
     retireFrame () {
         this.core.retire (this.host);
+        this.core.retireResources (this.host, this.resourceStore);
 
         this.reclaimBlocks ();
 
@@ -3729,36 +4840,68 @@ class Session {
         }
     }
 
+    // What the bodies answered commits its resources, in task id order, before
+    // any answer is shown: a commit can turn an answer into a failure, and the
+    // show is what makes either visible.
+    //
+    // A task whose loads would pass `max_resource_count`, or one of the three
+    // byte figures beside it, fails, and the sentence goes on its note exactly
+    // as a refused load's reason does. An unload of a resource that is not live
+    // where it settles ends the run.
+    commitResources () {
+        for (;;) {
+            const answer = this.core.commit (this.host, this.resourceStore);
+
+            if (answer.verdict === CORE.commit.settled) { return; }
+
+            if (answer.verdict === CORE.commit.dead) {
+                refuse (commitRefusal (answer));
+            }
+
+            const work = this.work.get (answer.task);
+
+            if (work && ! work.note) { work.note = commitRefusal (answer); }
+        }
+    }
+
+    // The whole of a frame boundary, in the rulebook's order: retire, commit,
+    // show. `advance` opens with it, and so does a harness standing in for one.
+    boundary () {
+        this.retireFrame ();
+        this.commitResources ();
+        this.showAnswers ();
+    }
+
     // What a body answered before this step, made visible to it.
     //
-    // `done` flips here and nowhere else, which is the whole of what
+    // `status` changes here and nowhere else, which is the whole of what
     // `host_core_show` is for: a task answered between two steps is answered for
     // the whole of the second, so nothing a game asks inside one call can
-    // disagree with itself. Nothing is held back and nothing is ordered - per-id
-    // status has no order to pin, so the array's whole rule family is gone with
-    // the array.
+    // disagree with itself.
     //
-    // WHAT IS LEFT HERE IS THE LOG. The blob copy went with the array;
-    // what this walks is the rows that flipped, stamping the frame on the marks
-    // and the reads because those are the page's account of a run rather than
-    // anything a game is told.
+    // WHAT IS LEFT HERE IS THE LOG: the rows that flipped, stamping the frame on
+    // the marks and the reads because those are the page's account of a run
+    // rather than anything a game is told.
     showAnswers () {
         const frame = this.frameIndex;
 
         // Read BEFORE the flip, because a row that has already flipped is
-        // indistinguishable from one that flipped three frames ago: `done` is a
-        // level, and what a mark records is the edge.
+        // indistinguishable from one that flipped three frames ago: `status` is
+        // a level, and what a mark records is the edge.
         const flipping = this.stagedTasks ();
 
         this.core.show (this.host);
+
+        const shown = new Map (this.rows ().map (row => [row.id, row]));
 
         for (const row of flipping) {
             const id = row.id;
 
             // Read back off the table rather than off the row above, which is a
-            // copy taken before the flip. A null block is the whole of what a
-            // failure is, here as at every other reader of it.
-            const block = this.core.bytes (this.host, id);
+            // copy taken before the flip - and a commit may have turned it into
+            // a failure since.
+            const after = shown.get (id);
+            const block = after && after.state === CORE.stateOf.succeeded;
 
             const work = this.work.get (id)
                 || { name: "", note: null, reads: [] };
@@ -3793,8 +4936,8 @@ class Session {
             // stream a page has for one.
             if (work.note) {
                 console.error (`player: task ${id} (${work.name}) did not `
-                    + `finish: ${work.note}. The id answers \`done\` with no `
-                    + `bytes, so the game takes whatever it does without one.`);
+                    + `finish: ${work.note}. Its status is failed, so the game `
+                    + `takes whatever it does without an answer.`);
             }
         }
     }
@@ -3863,12 +5006,11 @@ class Session {
     advance (buttons, edges, pointer) {
         // Before anything else this frame, and never again inside it: from here
         // to the next `advance` a task is either answered or not, which is what
-        // makes the flip attributable to one frame number. Retire then show, in
-        // that order and for `console_step`'s reason - last frame's blocks go
-        // before this frame's answers appear, so a released block stayed
-        // readable for the whole of the frame its release happened on.
-        this.retireFrame ();
-        this.showAnswers ();
+        // makes the flip attributable to one frame number. Retire, commit, then
+        // show, in that order and for `console_step`'s reason - last frame's
+        // blocks go before this frame's answers appear, and a commit can turn an
+        // answer into a failure before anything is shown.
+        this.boundary ();
 
         const delivered = this.deliver (buttons, edges, pointer);
 
@@ -3887,8 +5029,11 @@ class Session {
         const at = LAYOUT.pointer;
 
         if (delivered.pointer.present) {
-            input [at.x] = delivered.pointer.x;
-            input [at.y] = delivered.pointer.y;
+            const coordinates = new DataView (this.memory.buffer,
+                this.inputPtr, LAYOUT.inputBytes);
+
+            coordinates.setInt16 (at.x, delivered.pointer.x, true);
+            coordinates.setInt16 (at.y, delivered.pointer.y, true);
             input [at.present] = 1;
             input [at.hovers] = delivered.pointer.hovers ? 1 : 0;
 
@@ -3951,20 +5096,20 @@ class Session {
         // stashed it and used it later is refused naming the frame it was armed
         // for. Null is the count-zero spelling for the array.
         //
-        // Three arguments, and they are the header's three in the header's
+        // Four arguments, and they are the header's four in the header's
         // order. Arity is silent in BOTH directions here - JavaScript drops
-        // extras and passes `undefined` for what is missing - so a page still
-        // handing a module the five this call used to take would give it
-        // `runner` = the old results pointer, a plausible non-null value in the
-        // wrong slot. What catches that in the build tree is the committed
-        // golden compared against three independent implementations; what
-        // catches it between a DEPLOYED page and a deployed module is the arity
-        // check at load, which is the whole of what is left now that there is no
-        // import whose rename could carry a meaning change.
+        // extras and passes `undefined` for what is missing - so what catches a
+        // skew between a DEPLOYED page and a deployed module is the arity check
+        // at load. The store is armed on the runner's slot and its call is
+        // closed before the runner is retired, so a `step` returning holding a
+        // lock is refused naming `step` on the frame it happened.
         const runnerPtr = this.armRunner ();
+        const storePtr = this.armStore ();
 
-        const report = this.step (this.statePtr, this.inputPtr, runnerPtr) | 0;
+        const report = this.step (this.statePtr, this.inputPtr, runnerPtr,
+            storePtr) | 0;
 
+        this.retireStore ();
         this.retireRunner ();
 
         this.capture ();
@@ -4044,12 +5189,76 @@ class Session {
             audioState: this.audioStatePtr,
             audioStateSize: this.audioStateSize,
 
-            // And the eight bytes a reader record occupies. A consumer composes
-            // its OWN record there, over its own table's index for `read` -
-            // this is the address rather than the record, exactly as `game`
-            // above is the address of a descriptor each instance writes for
-            // itself.
-            reader: this.readerPtr,
+            // And the twelve bytes a renderer's store record occupies. A
+            // consumer composes its OWN record there, over its own table's
+            // indices - this is the address rather than the record, exactly as
+            // `game` above is the address of a descriptor each instance writes
+            // for itself.
+            store: this.renderStorePtr,
+
+            // And the declarations a consumer lays its own store out from, read
+            // here once rather than off its own instance's descriptor so that
+            // the mirror it keeps is the size of the table it mirrors and is
+            // held to the same figures. A mirror commits nothing, so the three
+            // byte figures bound nothing there; they travel so that a store is
+            // a store on either side of the message.
+            maxResourceCount: this.maxResourceCount,
+            maxTaskCount: this.maxTaskCount,
+            maxResourceBytes: this.maxResourceBytes,
+        };
+    }
+
+    // Every row of the store's table, in commit order, as a consumer is told
+    // about them: the id, the calls that may lock it, its size, where the arena
+    // put it and whether its unload has settled. Dead rows included, because a
+    // dead row is still in the table until the retire after it, and a renderer
+    // is answered from the table as it stood.
+    resources () {
+        const rows = [];
+
+        const count = this.core.resourceCount (this.resourceStore);
+
+        for (let index = 0; index < count; index++) {
+            const row = this.core.resource (this.resourceStore, index);
+
+            rows.push ({ id: row.id, scope: row.scope, size: row.size,
+                address: row.address, dead: row.dead,
+                committed: row.committed, unloaded: row.unloaded,
+                unloader: row.unloader });
+        }
+
+        return rows;
+    }
+
+    // The same rows with this host's half joined in - the file each came from
+    // and the task that loaded it - which is `inspector dump --resources` read
+    // on this host.
+    resourceTable () {
+        return this.resources ().map (row => {
+            const entry = this.loaded.get (row.id);
+
+            return { id: row.id, file: entry ? entry.file : "",
+                task: entry ? entry.task : 0, scope: row.scope,
+                committed: row.committed,
+                unloaded: row.dead ? row.unloaded : null };
+        });
+    }
+
+    // What `publishResources` reads a session for: the rows, and the bytes of
+    // one resource - out of this memory where `step` may lock it and out of the
+    // copy this host kept where only a renderer may.
+    publisher () {
+        return {
+            resources: () => this.resources (),
+            bytesAt: (address, size) => {
+                for (const entry of this.loaded.values ()) {
+                    if (entry.address !== address || ! entry.bytes) { continue; }
+
+                    return entry.bytes.slice ();
+                }
+
+                return this.bytesAt (address, size);
+            },
         };
     }
 
@@ -4072,7 +5281,7 @@ class Session {
 
     // The regions laid down once and never written again: the argument storage
     // and the save blob `construct` was handed. Both are the host's for the
-    // whole run by `interface/game.h:34-44`, so a game may hold a pointer into
+    // whole run by `interface/game.h:35-47`, so a game may hold a pointer into
     // either and a consumer needs both before the first state can be rendered.
     residentRegions () {
         const regions = [];
@@ -4092,59 +5301,56 @@ class Session {
     }
 }
 
-// The task blocks a consumer has not been handed, and the record of what it
-// has, brought up to date.
+// What one consumer is owed of the store: every row of the table as it stands,
+// and the bytes of the resources it has not been handed that its call may lock.
 //
-// BY ID RATHER THAN BY ADDRESS, and that is the whole of the care this needs.
-// The arena recycles a block the moment the frame boundary settles its release
-// (`reclaimBlocks` above), so one address carries one task's answer and then
-// another's; a record kept by address would take the second for the first and
-// leave a consumer rendering bytes that are two tasks old. An id is minted once
-// per run and names one block for its whole life, so an address arriving under
-// a new id is a delivery and an address arriving under the same one is not.
+// `publisher` is `{ resources, bytesAt }` - `Session.publisher` answers one,
+// and `goldenhash.js --mirror` builds its own - and `call` is the scope bit of
+// the call the consumer makes. `held` is the caller's own Set of ids already
+// sent to that consumer, mutated here: one consumer holds one of them, and
+// nothing here asks what any other consumer has.
 //
-// `held` is the caller's own Map from id to address, mutated here: one consumer
-// holds one of them, which is what makes release per consumer and local -
-// nothing here asks what any other consumer has, and the session waits on none
-// of them.
-function freshDeliveries (session, held) {
+// BY ID RATHER THAN BY ADDRESS. The arena recycles a block once the table
+// stops naming its resource (`reclaimBlocks` above), so one address carries one
+// resource and then another; an id is minted once per run and names one
+// resource for its whole life.
+//
+// The answer is `{ fresh, rows }`, and a consumer is handed both BEFORE the
+// description they belong with, on the same port: the rows are the table as it
+// stood when that description was captured, which is what a renderer is
+// answered from however much later it draws.
+function publishResources (publisher, held, call) {
+    const rows = publisher.resources ();
     const fresh = [];
     const live = new Set ();
 
-    for (const row of session.rows ()) {
-        if (! row.block) { continue; }
-
+    for (const row of rows) {
         live.add (row.id);
 
-        if (held.get (row.id) === row.block) { continue; }
+        // THE BYTES GO ONLY WHERE THE SCOPE SAYS, which is P6 of
+        // `docs/archived/resource-store-plan.md`: a consumer is told every
+        // row, because a lock from a call the scope does not name is refused
+        // rather than found missing, and is handed the bytes of the rows its
+        // call may lock and of no others.
+        if (held.has (row.id) || ! (row.scope & call)) { continue; }
 
-        const span = session.blocks.get (row.block);
+        held.add (row.id);
 
-        // A row naming a block this arena is not holding is not a delivery this
-        // host can serve, and there is no such row: `blocks` is written where
-        // the bytes are taken and cleared where the table stops naming them.
-        // Skipped rather than refused, because a consumer rendering last
-        // frame's picture is recoverable and a refused page is not.
-        if (! span) { continue; }
-
-        held.set (row.id, row.block);
-
-        // THE ID TRAVELS WITH THE BYTES, which is what a description needs and
-        // an address is not: a capture names a task by id, and the consumer
-        // resolving one has no table to look it up in. Nothing else about the
-        // record changed - a caller that only writes the bytes at their address
-        // reads the same two fields it always did.
-        fresh.push ({ id: row.id, address: row.block, span,
-            bytes: session.bytesAt (row.block, span) });
+        fresh.push ({ id: row.id, address: row.address,
+            bytes: publisher.bytesAt (row.address, row.size) });
     }
 
-    for (const id of [...held.keys ()]) {
+    for (const id of [...held]) {
         if (live.has (id)) { continue; }
 
         held.delete (id);
     }
 
-    return fresh;
+    return {
+        fresh,
+        rows: rows.map (row => ({ id: row.id, scope: row.scope,
+            size: row.size, address: row.address, dead: row.dead })),
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -4153,7 +5359,7 @@ function freshDeliveries (session, held) {
 //
 // PUBLISH BY MIRRORING, NOT BY SHARING. A state block holds absolute addresses
 // - into its own tail, into a task block, into the argument storage and into
-// the save blob, which is `interface/game.h:34-44`'s list - so a copy of it is
+// the save blob, which is `interface/game.h:35-47`'s list - so a copy of it is
 // complete only where every one of those addresses still means what it meant.
 // A copy at another address in the same memory does not: eleven of the twelve
 // games in this tree keep pointers in their state, measured in
@@ -4168,16 +5374,14 @@ function freshDeliveries (session, held) {
 // that stepped, and could only tell by reading a mutable byte outside the state
 // block, which `cmake/CheckStatics.cmake` already refuses.
 //
-// IT TAKES NO IMPORTS AND HOLDS NO HOST, and it installs a trampoline only
-// where a description can name a task. A renderer calls no host function of its
-// own accord - the runner and the loader are `step`'s and a body's - but a
-// capture carries an ID where a state block carried a pointer, so a renderer
-// handed a description has one question left and `Game_Task_Reader` is it.
-// Measured in `docs/runs/threaded-host-run.md` (a) over all forty-four
-// recordings and (c) inside an `AudioWorkletGlobalScope`; what has changed
-// since is the one wasm function this instance now needs in its own table, and
-// a `Consumer` built without a trampoline still renders - it answers every id
-// with nothing, which is what a game that names none never notices.
+// IT TAKES NO IMPORTS AND HOLDS NO SESSION, and it installs a trampoline and a
+// rulebook of its own so that a description can name a resource. A renderer
+// calls no host function but `lock` and `unlock`, and those are answered out of
+// a store this instance keeps as a MIRROR of the session's - filled from the
+// rows a session publishes, through `host_core_mirror_entry`, so a lock here
+// is refused by the same entry point and in the same sentence as a lock in the
+// simulation. A `Consumer` built without either still renders, and hands its
+// renderers the null store, which a game that names no resource never notices.
 //
 // IT LAYS NO ARENA DOWN. Every address it uses arrives in the `layout` its
 // session published, so there is no second copy of the prologue here that could
@@ -4198,7 +5402,7 @@ class Consumer {
     // ask it: `factory` writes host memory, this instance is discarded, and no
     // second reader of `LAYOUT` is invented for it. Such a consumer renders
     // nothing, because it has nowhere to render from or to.
-    constructor (module, layout, trampoline) {
+    constructor (module, layout, trampoline, core) {
         this.instance = new WebAssembly.Instance (module, {});
 
         const ex = this.instance.exports;
@@ -4272,8 +5476,18 @@ class Consumer {
         this.background =
             view.getUint8 (gamePtr + g.background) & (PALETTE_SIZE - 1);
 
-        this.taskMax = view.getUint32 (gamePtr + g.taskMax, true);
+        this.maxTaskCount = view.getUint32 (gamePtr + g.maxTaskCount, true);
         this.saveSize = view.getUint32 (gamePtr + g.saveSize, true);
+
+        // The frame, resolved, which is what the page clamps a pointer to. Not
+        // refused here: the simulation's own load refuses a declaration this
+        // instance would read the same way, and a declaration-only instance
+        // answers the page before that load has run, so it lands on the
+        // console's own frame rather than on a figure nothing will draw.
+        const frame = declaredFrame (view, gamePtr);
+
+        this.frameWidth = frame.refusal ? FRAME_WIDTH : frame.width;
+        this.frameHeight = frame.refusal ? FRAME_HEIGHT : frame.height;
 
         // What each renderer expects to be handed, read for the reason
         // `saveSize` is: a declaration about the module, and the same in every
@@ -4284,12 +5498,10 @@ class Consumer {
         this.videoStateSize = view.getUint32 (gamePtr + g.videoStateSize, true);
         this.audioStateSize = view.getUint32 (gamePtr + g.audioStateSize, true);
 
-        // The task blocks this instance holds, by the id that names them - the
-        // consumer's own half of what a session keeps in the rulebook's table.
-        // An id rather than an address for `freshDeliveries`'s own reason: the
-        // arena recycles a block the moment a release settles, so one address
-        // carries one task's answer and then another's.
-        this.blocks = new Map ();
+        // The resources whose bytes this instance has been handed, by id - the
+        // consumer's own half of what `publishResources` holds for it, and what
+        // decides whether a mirrored row carries an address or none.
+        this.accepted = new Set ();
 
         // Whether a description has arrived yet, one question per renderer, and
         // the answer every renderer here waits on: the hole is zeros until the
@@ -4308,33 +5520,46 @@ class Consumer {
 
         if (! layout) { return; }
 
-        // The one wasm function this instance needs of its own, and the record
-        // that names it. A description carries an ID where a state block
-        // carried a pointer, so a renderer here has to be able to ask - and a
-        // closure is not a wasm function, exactly as it is not one in the
-        // simulation's instance.
+        // The two wasm functions this instance needs of its own, the record
+        // that names them, and the store they answer out of. A description
+        // carries an ID where a state block carried a pointer, so a renderer
+        // here has to be able to lock one - and a closure is not a wasm
+        // function, exactly as it is not one in the simulation's instance.
         //
         // The RECORD's address is the session's, published in the layout beside
         // the framebuffer's, because this instance lays no arena down. What
-        // goes in it is this instance's own table index, which is why the
-        // record is composed here rather than mirrored across.
-        this.readerPtr = NO_READER;
-        this.readerArmed = false;
+        // goes in it is this instance's own table indices, which is why the
+        // record is composed here rather than mirrored across. The STORE is
+        // this instance's own too, in a rulebook instance of its own, laid out
+        // from the declarations the session published so the mirror is the
+        // size of the table it mirrors.
+        this.storePtr = NO_STORE;
+        this.core = null;
+        this.store = 0;
 
-        if (trampoline && layout.reader) {
+        // The call in progress, as its scope bit, and 0 between calls.
+        this.call = 0;
+
+        if (trampoline && core && layout.store) {
+            this.core = new HostCore (core);
+            this.store = this.core.beginResources (layout.maxResourceCount,
+                layout.maxTaskCount, layout.maxResourceBytes);
+
             this.slots = installTrampoline (trampoline, this.instance,
                 this.services ());
 
-            this.room (layout.reader, LAYOUT.reader.stride);
+            this.room (layout.store, LAYOUT.store.bytes);
 
             const compose = new DataView (this.memory.buffer);
 
-            compose.setUint32 (layout.reader + LAYOUT.reader.context, READER,
+            compose.setUint32 (layout.store + LAYOUT.store.context, RENDERING,
                 true);
-            compose.setUint32 (layout.reader + LAYOUT.reader.bytes,
-                this.slots.read, true);
+            compose.setUint32 (layout.store + LAYOUT.store.lock,
+                this.slots.lock, true);
+            compose.setUint32 (layout.store + LAYOUT.store.unlock,
+                this.slots.unlock, true);
 
-            this.readerPtr = layout.reader;
+            this.storePtr = layout.store;
         }
 
         // The second half of the same assertion, and the one a reader of a
@@ -4358,7 +5583,18 @@ class Consumer {
         // sit above both, so nothing here has shrunk the memory a renderer is
         // handed.
         this.room (layout.samples, SAMPLES_PER_FRAME * 2);
-        this.room (layout.video, FRAME_WIDTH * FRAME_HEIGHT);
+        this.room (layout.video,
+            LAYOUT.frame.pixels + this.frameWidth * this.frameHeight);
+
+        // The frame's head, written once and never again: the size this
+        // instance resolved off its own `Game`, which is what `render_video` is
+        // told it draws into. The same pair the simulation resolved, because
+        // it is one module read the same way.
+        const head = new DataView (this.memory.buffer, layout.video,
+            LAYOUT.frame.pixels);
+
+        head.setUint32 (LAYOUT.frame.width, this.frameWidth, true);
+        head.setUint32 (LAYOUT.frame.height, this.frameHeight, true);
 
         // And the two description holes, at the addresses the simulation chose
         // for them. The picture always, because a module describing none did
@@ -4370,60 +5606,79 @@ class Consumer {
         }
     }
 
-    // The one service a consumer answers, which is the whole of what a RENDERER
-    // may ask a host for.
-    //
-    // It answers out of `blocks` rather than out of a rulebook, and that is the
-    // difference between this and a session's `read`: a consumer holds copies
-    // of the blocks it was handed, at the addresses they were handed at, and
-    // the id it was handed them under is the whole of its table. What it cannot
-    // do is tell an id nobody ever spawned from one whose block it never
-    // received, so both arrive here as the same sentence.
+    // The two services a consumer answers, which are the whole of what a
+    // RENDERER may ask a host for, out of the mirror this instance keeps. The
+    // other five are inert here for the reason they are inert in a body's
+    // instance: the seven wrappers land at fixed table indices in every
+    // instance of one module.
     services () {
-        const put = (size, span) => {
-            if (! size) { return; }
+        const armed = (context) => {
+            if (! context) { return false; }
 
-            new DataView (this.memory.buffer).setUint32 (size, span >>> 0,
-                true);
+            if ((context >>> 0) === RENDERING && this.call) { return true; }
+
+            refuse (`${this.name} locked a resource through a store from `
+                + `outside the renderer it was handed to. A store is valid for `
+                + `one call and no longer.`);
         };
 
-        // The five a body's instance is given, inert here for the reason they
-        // are inert there: the six wrappers land at fixed table indices in
-        // every instance of one module, so an instance that installed one and
-        // one that installed six would disagree about what a number in a record
-        // means.
         return {
-            spawn: () => 0,
-            done: () => 0,
-            bytes: () => 0,
-            release: () => {},
-            load: () => 0,
+            ...inertServices (),
 
-            read: (context, id, size) => {
-                put (size, 0);
+            lock: (answerAt, context, id) => {
+                this.writeData (answerAt, 0, 0);
 
-                if (! context) { return 0; }
+                if (! armed (context)) { return; }
 
-                if (context !== READER || ! this.readerArmed) {
-                    refuse (`${this.name} named a task's bytes through a `
-                        + `reader from outside the renderer it was handed to. `
-                        + `A reader is valid for one call and no longer.`);
+                const answer = this.core.lock (this.store, id);
+
+                if (answer.verdict !== CORE.lock.taken) {
+                    refuse (lockRefusal (answer, id >>> 0, this.call));
                 }
 
-                const block = this.blocks.get (id);
+                this.writeData (answerAt, answer.bytes, answer.size);
+            },
 
-                if (! block) {
-                    refuse (`${this.name} was handed a description naming task `
-                        + `id ${id}, whose block this consumer does not hold. `
-                        + `A description names only an id the game held on the `
-                        + `frame it was captured on.`);
+            unlock: (context, id) => {
+                if (! armed (context)) { return; }
+
+                if (this.core.unlock (this.store, id) !== CORE.unlock.taken) {
+                    refuse (unlockRefusal (id >>> 0, this.call));
                 }
-
-                put (size, block.span);
-
-                return block.address;
             },
         };
+    }
+
+    // A `Game_Data` at the address a wasm32 struct return goes through, in
+    // this instance's own memory.
+    writeData (at, bytes, size) {
+        if (! at) { return; }
+
+        const view = new DataView (this.memory.buffer);
+
+        view.setUint32 ((at >>> 0) + LAYOUT.data.bytes, bytes >>> 0, true);
+        view.setUint32 ((at >>> 0) + LAYOUT.data.size, size >>> 0, true);
+    }
+
+    // One call, opened on the mirror and closed the moment the renderer
+    // returns: a renderer that returns holding a lock ends the run naming
+    // itself, in the sentence the simulation gives `step`.
+    openCall (call) {
+        this.call = call;
+
+        if (this.core) { this.core.openCall (this.store, call); }
+    }
+
+    closeCall () {
+        this.call = 0;
+
+        if (! this.core) { return; }
+
+        const closed = this.core.closeCall (this.store);
+
+        if (closed.verdict === CORE.close.holding) {
+            refuse (holdingRefusal (closed));
+        }
     }
 
     // Enough linear memory for `span` bytes at `at`, which is the whole of what
@@ -4450,35 +5705,42 @@ class Consumer {
         new Uint8Array (this.memory.buffer, address, bytes.length).set (bytes);
     }
 
-    // A task's output, at its own address AND under its own id. The bytes go
-    // where `accept` would put them; what this adds is the row a description
-    // naming that id is answered out of.
-    acceptTask (id, address, bytes) {
-        if (! bytes || ! bytes.length) { return; }
+    // The resources `publishResources` handed this instance, each at its own
+    // address AND under its own id.
+    acceptResources (fresh) {
+        for (const resource of fresh || []) {
+            this.accept (resource.address, resource.bytes);
 
-        this.accept (address, bytes);
-
-        this.blocks.set (id, { address, span: bytes.length });
+            this.accepted.add (resource.id);
+        }
     }
 
-    // And what the simulation still holds, which is what this instance may go
-    // on answering for.
+    // And the table as it stood when the next description was captured, which
+    // is what this instance's renderers are answered from until the next one.
     //
-    // THE RETENTION RULE, from the consumer's side. A release is marked and
-    // settles at the next frame boundary, so a row released on frame N is still
-    // in the table when this is called on frame N and is gone when it is called
-    // on frame N + 1 - which is one capture of grace and exactly what
-    // `interface/game.h` promises a description: the block is held until a
-    // description captured after the release has been rendered.
-    //
-    // `held` is `freshDeliveries`'s own map, mutated by it and read here, so
-    // the two ends of the same tick agree about the same set without either
-    // asking the other.
-    retainTasks (held) {
-        for (const id of [...this.blocks.keys ()]) {
-            if (held.has (id)) { continue; }
+    // THE RETENTION RULE, from the consumer's side. A row whose unload settled
+    // is still in the session's table until the retire after it, so it is
+    // still here, dead: a renderer drawing a description captured before the
+    // unload settled was published it live, and one captured after is refused
+    // it. An id the table stops naming is forgotten here as well.
+    mirrorResources (rows) {
+        if (! this.core) { return; }
 
-            this.blocks.delete (id);
+        this.core.mirrorClear (this.store);
+
+        const live = new Set ();
+
+        for (const row of rows || []) {
+            live.add (row.id);
+
+            this.core.mirrorEntry (this.store, row.id, row.scope, row.size,
+                this.accepted.has (row.id) ? row.address : 0, row.dead);
+        }
+
+        for (const id of [...this.accepted]) {
+            if (live.has (id)) { continue; }
+
+            this.accepted.delete (id);
         }
     }
 
@@ -4518,8 +5780,9 @@ class Consumer {
     }
 
     get frame () {
-        return new Uint8Array (this.memory.buffer, this.layout.video,
-            FRAME_WIDTH * FRAME_HEIGHT);
+        return new Uint8Array (this.memory.buffer,
+            this.layout.video + LAYOUT.frame.pixels,
+            this.frameWidth * this.frameHeight);
     }
 
     // The game's own renderer, on the bytes it was handed. `false` for a
@@ -4528,12 +5791,12 @@ class Consumer {
     renderVideo () {
         if (! this.layout || ! this.videoReady) { return false; }
 
-        this.readerArmed = true;
+        this.openCall (CORE.scope.video);
 
-        this.renderVideoFn (this.layout.videoState, this.readerPtr,
+        this.renderVideoFn (this.layout.videoState, this.storePtr,
             this.layout.video);
 
-        this.readerArmed = false;
+        this.closeCall ();
 
         return true;
     }
@@ -4546,12 +5809,12 @@ class Consumer {
             return new Int16Array (SAMPLES_PER_FRAME);
         }
 
-        this.readerArmed = true;
+        this.openCall (CORE.scope.audio);
 
-        this.renderAudioFn (this.layout.audioState, this.readerPtr,
+        this.renderAudioFn (this.layout.audioState, this.storePtr,
             this.layout.samples);
 
-        this.readerArmed = false;
+        this.closeCall ();
 
         return new Int16Array (new Int16Array (this.memory.buffer,
             this.layout.samples, SAMPLES_PER_FRAME));
@@ -5080,7 +6343,7 @@ function argumentList (args, core) {
 
     if (settled.verdict === CORE.argument.crowded) {
         refuse (`this run carries ${args.length} arguments, and this host `
-            + `carries at most ${core.figure (CORE.figure.argumentMax)}. `
+            + `carries at most ${core.figure (CORE.figure.maxArgumentCount)}. `
             + `It is a bound on what a CALLER may `
             + `say rather than on anything a game wants: one address, one `
             + `command line and one recording have to be one run, so a `
@@ -5099,7 +6362,7 @@ function argumentList (args, core) {
     if (settled.verdict === CORE.argument.longName) {
         refuse (`\`${name}\` is ${name.length + 1} bytes with its `
             + `terminator, and this host holds a name of `
-            + `${core.figure (CORE.figure.argumentNameMax)}. `
+            + `${core.figure (CORE.figure.maxArgumentNameBytes)}. `
             + `It is mirrored rather than agreed so that the slot a `
             + `session keeps a name in and the slot a recording writes it `
             + `under cannot be two different sizes.`);
@@ -5127,7 +6390,7 @@ function argumentList (args, core) {
 
     if (settled.verdict === CORE.argument.longValue) {
         refuse (`\`${name}\` carries ${value.length} bytes, and a host `
-            + `holds ${core.figure (CORE.figure.argumentTextMax)} `
+            + `holds ${core.figure (CORE.figure.maxArgumentTextBytes)} `
             + `with the terminator. A run's values live `
             + `in the session's own fixed size storage, so a value past `
             + `that is refused rather than truncated into something the run `
@@ -5155,11 +6418,20 @@ function argumentList (args, core) {
 // never seen at all.
 //
 // So each event carries the instant it arrived, and a step consumes only those
-// at or before its own boundary. `event.timeStamp` shares a clock with the
-// timestamp `requestAnimationFrame` is passed - measured - but that timestamp
-// is the frame's nominal start and can predate an event already in hand, so the
-// boundary is a clock the caller advances in fixed steps, never one re-derived
-// from the animation frame.
+// at or before the instant it is drained to. `event.timeStamp` shares a clock
+// with the timestamp `requestAnimationFrame` is passed - measured - but that
+// timestamp is the frame's nominal start and can predate an event already in
+// hand, which is why the caller advances a clock of its own in fixed steps
+// instead of taking the animation frame's timestamp as every step's boundary:
+// the steps of a catch-up burst simulate earlier time and have to drain to
+// earlier instants, or a press lands on a step that ran before it.
+//
+// What a callback's timestamp predating an event does NOT do is lose the event.
+// A drain reaching an instant an event is past leaves it queued for the next
+// step, exactly as a boundary standing further behind does - so a drain that
+// only ever reaches FORWARD costs nothing, and `Clock.advance` does reach
+// forward, to the callback's own instant, for the LAST step of a burst and no
+// other. That step is the one whose state the page is about to show.
 //
 // Input is still sampled once per step, but a press that arrives and departs
 // between two boundaries is no longer lost: draining records it in `edges`,
@@ -5432,8 +6704,8 @@ class Input {
 // coming until input arrives or a task result does, and `step` is a pure
 // function of state, input and results - so the claim propagates itself for as
 // long as both hold still, and a host may simply stop calling it. The wake list
-// SHRANK with the events array: residency now changes only by a delivery or by
-// the game's own release, and a release is something a `step` did.
+// SHRANK with the events array: a status now changes only by an answer or by
+// the game's own finalize, and a finalize is something a `step` did.
 //
 // It differs from the other two in the direction that matters, and the
 // difference is who is expected to notice. `paused` is undone by the player and
@@ -5455,6 +6727,16 @@ class Input {
 
 // Whether the loop should be stepping at all.
 function halted (halt) { return halt.paused || halt.hidden || halt.idle; }
+
+// And whether anybody has stopped LISTENING, which is the player's flag and the
+// host's but never the game's: both of these mean somebody stopped listening
+// this instant, where a game with nothing to do is still being watched. It is
+// the whole of what suspends an audio context AT ONCE - a game at rest is put
+// away on a timer instead, which is the page's - so it is a function rather
+// than an OR written twice: `haltChange` answers `stop` on it, and the page
+// re-reads it on the frame a pause is waiting for, where reading the wider one
+// would suspend a game that had merely rested inside a round trip.
+function silenced (halt) { return halt.paused || halt.hidden; }
 
 // What a change to those three flags asks of the page.
 //
@@ -5481,13 +6763,13 @@ function halted (halt) { return halt.paused || halt.hidden || halt.idle; }
 // hardware once per move for the whole of a game that thinks between moves - so
 // the page waits it out, and how long is the page's business rather than this
 // function's. `start` is either of those undone.
+//
+// The third answer was taken out for a day and is back. What it was blamed for
+// - a move after a long rest reaching the screen hundreds of milliseconds late
+// - outlived its removal and belonged to the canvas layer's commit path, which
+// `render.worker.js` now keeps awake by writing on every display frame;
+// `docs/runs/scan-out-run.md` holds both readings.
 function haltChange (before, after) {
-    // The page itself having stopped being played, which is the player's flag
-    // and the host's but never the game's: both mean somebody stopped
-    // listening this instant, where a game with nothing to do is still being
-    // watched.
-    const silenced = (halt) => halt.paused || halt.hidden;
-
     // A game resting with the page still in front of the player, which is the
     // one halt the sound leaves slowly.
     const resting = (halt) => halted (halt) && ! silenced (halt);
@@ -5501,6 +6783,12 @@ function haltChange (before, after) {
         ? null
         : halted (after) ? "stop" : "start";
 
+    // Three answers over three states, in the order that makes the last one
+    // need no test of its own: reaching it means the page is neither silenced
+    // nor resting NOW, which is the whole of not being halted, so the last
+    // branch is a run that was stopped for one of the three reasons and is not
+    // stopped for any of them any more. A game resting on and on is caught a
+    // line above it, where both ends are resting and nothing is asked for.
     const sound = silenced (after) ? (silenced (before) ? null : "stop")
         : resting (after) ? (resting (before) ? null : "rest")
         : halted (before) ? "start" : null;
@@ -5509,9 +6797,9 @@ function haltChange (before, after) {
 }
 
 // ---------------------------------------------------------------------------
-// What a wall clock instant owes a game: the accumulator, the boundary the
-// input queue is drained to, the cap on a catch-up and the decision that a run
-// may stop.
+// What a wall clock instant owes a game: how many steps a callback is worth,
+// the boundary the input queue is drained to, the cap on a catch-up and the
+// decision that a run may stop.
 //
 // All of it used to live inside the page's animation-frame callback, and all of
 // it is on this side of the line the two files are split along - a timestamp
@@ -5551,25 +6839,273 @@ function haltChange (before, after) {
 // posting the timestamps, and 27.8 phase-locked with a p90 of 48.5 against
 // postback's 47.6.
 //
-// The worker asks the display for its own frames now, so there is nothing left
-// to estimate: a `requestAnimationFrame` callback inside the worker IS the
-// vsync. `sim.worker.js` runs this clock on that timestamp and publishes what
-// the tick produced, and the page's animation frame is left reading a heartbeat
-// for the watchdog below. The picture is drawn a thread further out, on receipt
-// rather than on a frame of its own, which is
-// `docs/archived/render-worker-plan.md`'s one display frame of latency and the
-// only clock in this player that is not the display's.
+// THOSE THREE MEDIANS DO NOT PRICE THE THREE SHAPES AGAINST EACH OTHER, and
+// `docs/decisions.md` item 55 is what struck them. One run of a shape carries a
+// per-run constant of up to four frames - the instant the queue below was
+// drained to settled in the run's first moments and was then held - so one
+// sample of each shape is three samples of one distribution. What survives is
+// the comparison made INSIDE a run: a constant offset moves a run's p50 and its
+// p90 together, so the gap between them is the phase estimate's own bimodality
+// and the reason this shape was not shipped is unaffected.
 //
-// `docs/runs/drawing-worker-run.md` is what measured that a worker may have one:
-// a worker's animation frame ran at p50 16.7 ms over 301 samples in Chrome 152
-// and p50 17 over 288 in Safari 26.6.2, both with zero intervals over a frame
-// and a half, and both are the display's own cadence rather than a timer's. The
-// same log records the two things that follow. The display is NOT the
+// THE PAGE READS THE DISPLAY AND THE WORKER STEPS ON WHAT IT POSTS, which is
+// neither of those two shapes and takes the best half of each. `player.html`'s
+// `loop` arms itself and posts its own animation-frame timestamp, and
+// `sim.worker.js` runs this clock on the number it is handed and publishes what
+// the tick produced. There is nothing to estimate, because the timestamp is a
+// real callback's; and the round trip costs nothing, because the page posts and
+// carries on - what comes back is the heartbeat the watchdog below was reading
+// anyway, and no callback here ever waits for it.
+//
+// IT WAS THE WORKER'S OWN ANIMATION FRAME UNTIL 2026-09-28, on a sentence this
+// block used to carry: a `requestAnimationFrame` callback inside the worker IS
+// the vsync. It is not, in Safari, and the whole of this clock was placed on
+// it. `docs/runs/drawing-worker-run.md` read p50 16.7 ms over 301 samples in
+// Chrome 152 and p50 17 over 288 in Safari 26.6.2 and concluded both were the
+// display's own cadence; Safari quantizes animation-frame timestamps to 1 ms, so
+// that second median is consistent with anything from 16.5 to 17.5, and a RATE
+// was never the question. The PHASE is: `docs/runs/frame-cadence-run.md` section
+// 8 put a Safari worker's callbacks at a circular concentration of 0.147 round
+// the refresh period against a uniform null of 0.097, where Chrome's worker
+// reads 0.985. A thread asked exactly sixty times a second still cannot be
+// smooth while its callbacks land at a drifting phase, and no rule running on
+// that thread can correct it. Section 19 of the same log is why `step` stayed on
+// a thread of its own even so: a wedged one is a thread the page can end, and
+// nothing on the page could report a page that had wedged itself.
+//
+// What that log records and this change leaves alone. The display is NOT the
 // simulation's rate - it read 120 Hz in one reading and 60 Hz in another on one
 // panel - so a frame callback owes whatever `advance` below says it owes and
-// often nothing. And a hidden tab stops a worker's animation frame dead in
-// Chrome while leaving its timer unthrottled, which is why the halt that stops
-// the worker asking is load bearing rather than tidy.
+// often nothing. And a hidden tab stops an animation frame dead in Chrome while
+// leaving a timer unthrottled, which is why the halt that stops the page posting
+// is load bearing rather than tidy. The picture is still RENDERED a thread
+// further out, which is `docs/archived/render-worker-plan.md`'s one display
+// frame of latency; what is no longer out there is the CANVAS, which came back
+// to the page the day after this phase landed so that the commit lands on the
+// display's own callback too. `docs/archived/page-commit-plan.md`.
+
+// THE RULE THIS FILE USED TO CARRY ASKED THE WRONG QUESTION, and the whole of
+// the section below is the answer to the right one.
+//
+// It asked "how long since last time", got 16, 17, 16, 18, 17, 15 where the
+// truth is 16.667, and owed a step at exactly 16.667 - so a reading of 16 fell
+// just short, nothing moved, and the leftover made the next callback step
+// twice. Rounding each interval to what the display MEANT to deliver and
+// carrying the rounding error fixed the worst of that and is still the wrong
+// shape: it consults a measurement that wobbles by a millisecond, sixty times a
+// second, and acts on every wobble. On a display measured at exactly 60.000 Hz
+// against the window server, with Safari's page delivering 2,391 callbacks
+// where 2,400 were due, it turned that stream into 57 crooked commits in 40
+// seconds where the browser's own bursts and stalls set a floor of about 9.
+// `docs/runs/frame-cadence-run.md` sections 10 to 12 are the readings, and
+// `docs/frame-clock-plan.md` is the design.
+//
+// TRUST THE RATE, RECONCILE RARELY. Decide once how many steps a callback is
+// worth, count callbacks, and consult the wall clock only when the accumulated
+// difference has grown past a deadband. Three pieces, and the division of
+// labour between them is the point:
+//
+//   - `refreshRate` below reads a rolling estimate of the thread's own rate and
+//     maps it to a plausible refresh rate. A CHOICE rather than a number, so
+//     ordinary noise can never move it and a real change moves it decisively.
+//   - `Clock.advance` then advances by a CONSTANT amount per callback - one
+//     step per callback at 60 Hz, one per two at 120, five per twelve at 144 -
+//     so stepping is regular by construction and the interval's jitter never
+//     reaches it at all.
+//   - And the NET deficit is reconciled past a deadband: the wall clock says
+//     the run owes so many steps, it has taken so many, and while the
+//     difference is inside the band nothing happens. Past it, one extra step or
+//     one skipped, and never a correction derived from a single interval.
+//
+// THE RECONCILIATION IS ALWAYS RIGHT AND THE ESTIMATE ONLY MAKES THE MOTION
+// SMOOTH. That is the sentence to keep: a perfect estimate leaves the
+// reconciliation nothing to do, and a stale or wrong one - the second after a
+// display changes - makes the motion briefly rough and cannot make the game run
+// at the wrong speed. Which is why the estimate is allowed to be a rolling
+// median over a second rather than something clever, and why nothing below
+// treats it as authority.
+//
+// STEPS A SECOND IS A GATE ON THIS RULE AND NEVER A DIAGNOSTIC. Three rules in
+// the investigation that produced this one looked perfect by getting the rate
+// wrong - rounding without carrying the drift, rounding only to whole frames,
+// and one step per callback with no correction at all, which posts ZERO crooked
+// commits by running the game 0.43% slow. `Game_Audio_Block` is 800 samples a
+// step against a 48 kHz device, so that last one is a 208-sample shortfall a
+// second and a queue of 2,400 drained in eleven. A rule that smooths by running
+// the game slow is a failure whatever else it posts.
+
+// The rates a thread that the display drives is allowed to be read as.
+//
+// A small closed set rather than the measurement itself, because the value of
+// snapping is EXACTNESS: at a chosen 60 against a contract of 60 a callback is
+// worth exactly one step, the credit below lands exactly on its boundary, and
+// there is no residue left for jitter to turn into motion. A measurement of
+// 59.94 would leave a thousandth of a step a frame, which is the same defect
+// one decimal place further down.
+const REFRESH_RATES = [30, 50, 60, 90, 120, 144];
+
+// How many intervals the estimate is taken over, and a MEDIAN over them rather
+// than a mean.
+//
+// A mean is moved by exactly the two things that are not evidence about a
+// display's rate. That stream carried 22 intervals under 9 ms - Safari
+// delivering callbacks in bursts - and 16 over 24 ms including single stalls of
+// 71 and 88 ms, and each of those drags a mean the way a refresh never would.
+// A median is moved by neither, needs no rejection window, and therefore cannot
+// do the thing a rejection window can: lock itself onto a wrong value by
+// refusing every sample that would correct it.
+//
+// Sixty-one is a second of a 60 Hz display and half a second of a 120 Hz one,
+// and it is odd so the middle is a sample rather than a mean of two. What it
+// costs is that a display CHANGING under the run is not seen until 31 of the
+// intervals are the new one - a fifth of a second on the panel that replaces a
+// 60 Hz display at 144 - and what happens meanwhile is that the reconciliation
+// runs the game at the right speed over a rougher cadence.
+const RATE_WINDOW = 61;
+
+// How near a candidate a measurement has to be to be read as that candidate,
+// and how far it has to go to give one up.
+//
+// Two numbers rather than one, because a single threshold chatters exactly
+// where a display sits on it. The wider one is the hysteresis: a rate already
+// chosen is kept while the measurement is anywhere near it, so the 58.1 Hz a
+// worker's animation frame settles at in Safari is still read as the 60 Hz
+// display behind it, and the reconciliation pays the 1.9 frames a second that
+// thread is short.
+//
+// A measurement near NO candidate is used as it stands, which is the case a
+// closed set would otherwise get wrong: a 75 Hz panel is not in the table
+// above, sits exactly between two that are, and would be run at the wrong rate
+// by whichever of them it was forced onto. Taken as itself it costs nothing at
+// all - 4 steps for every 5 callbacks, exact, and no reconciliation.
+const RATE_SNAP = 0.08;
+const RATE_HOLD = 0.15;
+
+// The plausible refresh rate a measured interval is read as, given the rate
+// that is already chosen.
+//
+// `chosen` of 0 is a clock that has never had an interval, which is the first
+// callback after a prime and the only time this answers from one sample.
+//
+// The clamp is what keeps a single absurd sample out of a divisor. A thread
+// delivering callbacks a thousandth of a millisecond apart is not a display and
+// the measured stream in section 11 carries five intervals of 1 ms, so the one
+// callback where the median IS that sample would otherwise be read as a million
+// hertz and hand `Clock` below a step worth a millionth of one.
+function refreshRate (interval, chosen) {
+    const measured = Math.min (1000, Math.max (1, 1000 / interval));
+
+    if (REFRESH_RATES.includes (chosen)
+        && Math.abs (measured - chosen) <= chosen * RATE_HOLD) {
+        return chosen;
+    }
+
+    let nearest = REFRESH_RATES [0];
+
+    for (const one of REFRESH_RATES) {
+        if (Math.abs (measured - one) < Math.abs (measured - nearest)) {
+            nearest = one;
+        }
+    }
+
+    return Math.abs (measured - nearest) <= nearest * RATE_SNAP
+        ? nearest : measured;
+}
+
+// Where `value` belongs in a window held in order - and, for a value the
+// window already holds, where it is.
+//
+// The median is wanted once a callback on the simulation's own thread, and the
+// obvious spelling of it is not free. Measured under node over 240,000
+// callbacks: the whole of `advance` cost 0.4 us before this rule existed, a
+// 61-element copy and sort per callback took it to 9.9, and keeping a second
+// array in order - the oldest taken out and the newest put in where they
+// belong - takes it to 2.0. Twenty-five times the arithmetic it was added to,
+// for a number that moves by one sample, against five.
+//
+// None of the three is visible inside a 16.7 ms frame and that is not the
+// argument. The argument is that a median is an O(n) reading of a window that
+// changes by one element, and spelling it as a sort is paying for a sort.
+function placeIn (ranked, value) {
+    let low = 0, high = ranked.length;
+
+    while (low < high) {
+        const middle = (low + high) >> 1;
+
+        if (ranked [middle] < value) { low = middle + 1; }
+        else { high = middle; }
+    }
+
+    return low;
+}
+
+// The net deficit, in steps, that is allowed to stand without anything being
+// done about it, and the one past which it is given up rather than paid.
+//
+// The deadband is the dial between smoothness and how far simulated time may
+// lag the wall clock, and it is the whole difference between this rule and the
+// one it replaces. Over the measured interval distribution in section 11 of
+// `docs/runs/frame-cadence-run.md`, 24 shufflings of it, mean crooked commits
+// in 40 s against the steps a second they were bought at:
+//
+//      band   crooked   steps/s
+//      0.5      141      60.00     the shipped rule, on the same streams,
+//      1         39      60.01     is 53.8, and the floor the browser's own
+//      2         20      60.01     bursts and stalls set is about 9.
+//      3         14      60.00
+//      5         10      59.97
+//      8          2      59.79     <- and this row is the trap
+//
+// THE LAST ROW IS WHY `steps/s` IS A GATE. At eight the deadband has reached
+// `BACKLOG` below, so a deficit is dropped instead of being paid, and the rule
+// posts two crooked commits in 40 seconds by running the game a third of a per
+// cent slow - the same failure as one step per callback with no correction at
+// all, arrived at from the other end.
+//
+// THREE is the number this rule ships with, and it is the owner's reading of
+// that table rather than a derivation: three takes the cadence from 20 crooked
+// commits in 40 seconds to 14 - two thirds of the way from two down to the
+// floor of nine - where five would buy four more and start bending the rate. On
+// a paddle game the trade is a judgement about feel, and that is whose
+// judgement it is.
+//
+// WHAT THAT TRADE WAS TOLD IT COST WAS WRONG IN KIND, and this paragraph used
+// to be where it was told. It read: simulated time may lag wall time by three
+// frames, 50 ms, where the rule before it lagged by at most an accumulator's
+// remainder; the queue drains to the simulated boundary; so the band costs 50
+// ms of input latency and nothing else, and 17 ms more than a band of two,
+// worst case. The lag is real and is still what this constant buys. The rest
+// was not a worst case - the boundary settled at a level in a run's first
+// moments and then HELD it, so it was a toll every press of that run paid, and
+// a reload was the only thing that re-rolled it. `docs/decisions.md` item 55
+// and `docs/runs/input-boundary-run.md` are the measurement. A stall is the
+// exception and is bounded by the two numbers rather than by this one: the lag
+// it opens is paid back a step a callback, and anything over `BACKLOG` is
+// dropped instead.
+//
+// AND THE INPUT HALF OF IT IS NOT PAID AT ALL NOW, which is why THREE above no
+// longer names a latency it gives up rather than naming a corrected one.
+// `advance` below drains the last step of a callback's burst to the callback's
+// own instant, so the band's width no longer reaches the step a player feels
+// whatever it is set to: `products/web-player/tests/loop.js` sweeps 60, 120,
+// 144, 90, 30 and 57.8 Hz and a first-second stall of every size from 0 to 64
+// ms, and reads the boundary level with the callback on every one of them. The
+// earlier steps of a burst still drain to earlier instants, because they
+// simulate earlier time and a key handed to one of them is back-dated onto a
+// step that ran before the hand moved.
+//
+// What the band also costs is the RESOLUTION of a reading. A deficit standing
+// anywhere in it is up to three steps not yet taken, so steps a second measured
+// over a 40 s window cannot be pinned tighter than about 0.075 however right the
+// rule is - which is the gate exactly, and is why the cases that
+// measure the rate run longer streams than the ones that measure the cadence.
+//
+// `BACKLOG` is eight because the step cap is eight: a callback will not run more
+// steps than that, so a deficit larger than it cannot be paid off inside one
+// callback however far behind the run has fallen, and a run paying off eight
+// frames at one a callback is already 133 ms of hands-ahead-of-game.
+const DEADBAND = 3;
+const BACKLOG = 8;
 
 class Clock {
     // `session` is a function answering with the session that is playing NOW,
@@ -5588,14 +7124,61 @@ class Clock {
         this.audio = audio;
         this.rate = rate;
 
-        this.accumulator = 0;
         this.last = 0;
 
-        // The wall clock instant this step's boundary stands at. It advances in
+        // THE NET DEFICIT, in seconds: wall clock time this run has been handed
+        // and has not yet stepped. Every interval goes in and every step comes
+        // out, so it is the ONLY thing the wall clock is read for, and the
+        // deadband below is a band around it rather than around any one
+        // interval.
+        //
+        // It is signed. Negative is a run that has stepped further than the
+        // wall clock has reached, which the constant advance does whenever the
+        // rate estimate reads a little fast, and which is corrected by skipping
+        // a step rather than by stalling one.
+        this.accumulator = 0;
+
+        // The last `RATE_WINDOW` intervals in milliseconds - once in the order
+        // they arrived, so the oldest can be found, and once in order of
+        // length, so the median can be read without sorting anything - and the
+        // rate that median is read as. `display` of 0 is a clock with no
+        // estimate at all, which owes its first callback nothing and takes that
+        // callback's own interval as its first evidence.
+        //
+        // These deliberately survive `prime`: a tab that was hidden and a pause
+        // that was lifted are not a display being swapped, and the estimate a
+        // run has already paid for should not have to be paid for twice. What
+        // `prime` forgets is what was OWED, which is the two below.
+        this.intervals = [];
+        this.ranked = [];
+        this.display = 0;
+
+        // What the constant advance has accrued and not yet spent, counted in
+        // units the estimate makes exact: a callback is worth `rate`, a step
+        // costs `display`, so a callback buys `rate / display` steps and the
+        // remainder is carried as an integer whenever both are. At 60 against
+        // 60 that is one step a callback with nothing carried; at 60 against
+        // 144, five steps every twelve callbacks, held for two refreshes and
+        // three in the same repeating pattern forever.
+        //
+        // Integer where it matters is the whole point, and it was measured
+        // rather than argued. A credit of `rate / display` accumulated as a
+        // DOUBLE misses its boundary at 90 Hz - two thirds added three times is
+        // 1.9999999999999998, so the third callback of every cycle does not
+        // step - and the run drifts out of the cadence it was built to keep. A
+        // rule whose commits depend on the last bit of a double is the defect
+        // this one replaced, one abstraction further up.
+        this.credit = 0;
+
+        // The wall clock instant a step's boundary stands at. It advances in
         // whole frames and is never reset to `now`, so it stays behind the wall
-        // clock by at most the accumulator's remainder - the one exception is
-        // the backlog drop below, which is where a machine that cannot keep up
-        // gives up the lag rather than carrying it.
+        // clock by at most the deficit above - the one exception is the backlog
+        // drop below, which is where a machine that cannot keep up gives up the
+        // lag rather than carrying it.
+        //
+        // It is every step's boundary but the LAST of a callback's burst, which
+        // is drained to the callback's own instant when that is later. `advance`
+        // says why only that one, and the field is untouched by it.
         this.simTime = 0;
     }
 
@@ -5605,6 +7188,42 @@ class Clock {
     prime () {
         this.last = 0;
         this.accumulator = 0;
+
+        // What a callback is worth goes with the callbacks it was owed against:
+        // a clock coming back from a hidden tab is not owed the part-step the
+        // frames it slept through had accrued.
+        this.credit = 0;
+    }
+
+    // The rate estimate, given one more interval to read.
+    //
+    // A stall and a burst both arrive here and neither moves the answer, which
+    // is what a median buys: a stall is not evidence about the display's rate,
+    // and neither is the burst a browser catches up with afterwards.
+    //
+    // An interval of zero is a timestamp a browser has handed out twice, which
+    // is evidence about nothing and is the one value that must not reach the
+    // divisor below. A clock that has seen no interval at all assumes the
+    // display runs at the contract's own rate, which is the commonest case and
+    // the one that owes exactly one step a callback.
+    reads (delta) {
+        if (delta > 0) {
+            if (this.intervals.length === RATE_WINDOW) {
+                const oldest = this.intervals.shift ();
+
+                this.ranked.splice (placeIn (this.ranked, oldest), 1);
+            }
+
+            const interval = delta * 1000;
+
+            this.intervals.push (interval);
+            this.ranked.splice (placeIn (this.ranked, interval), 0, interval);
+        }
+
+        if (! this.ranked.length) { this.display = this.rate; return; }
+
+        this.display = refreshRate (this.ranked [this.ranked.length >> 1],
+            this.display);
     }
 
     // One animation frame's worth of simulation, and what the page owes the
@@ -5638,7 +7257,75 @@ class Clock {
         this.last = now;
 
         if (delta > 0.25) delta = 0.25;         // never spiral after a tab switch
+
+        this.reads (delta);
         this.accumulator += delta;
+        this.credit += this.rate;
+
+        // THE RECONCILIATION, and it is read against what this callback is
+        // ABOUT to spend rather than against what it has spent nothing of yet.
+        //
+        // `owed` is therefore the deficit that will still be standing once the
+        // regular steps below have run - the lag a player would actually be
+        // playing against - and the deadband is a band around THAT. Read the
+        // other way round it is off by a callback's own worth, which is
+        // invisible at 60 Hz and fires a correction on every single callback of
+        // a 30 Hz display, where one callback is two whole steps.
+        //
+        // One step either way and never more, because the size of the
+        // correction is the size of the visible hitch. A deficit larger than
+        // one step is paid off over the callbacks that follow, a step at a
+        // time, and the drop below is what stops that being unbounded.
+        const due = Math.floor (this.credit / this.display);
+        const owed = this.accumulator * this.rate - due;
+
+        if (owed >= DEADBAND) { this.credit += this.display; }
+        else if (owed <= -DEADBAND) { this.credit -= this.display; }
+
+        // HOW MANY STEPS THIS CALLBACK IS ABOUT TO RUN, which is here for one
+        // reason: to know which of them is the LAST one, because that is the
+        // only step that drains the queue to the callback's own instant.
+        //
+        // `simTime` is set from a timestamp on the first callback after a prime
+        // and advances in whole frames afterwards, so a run's offset from the
+        // wall clock is decided in its first moments and then kept. A boundary
+        // standing a frame behind the callback draining to it takes NONE of the
+        // keys pressed since the last callback - a whole frame of input latency,
+        // for the whole run, re-rolled by a reload and by nothing else. Section
+        // 19 of `docs/runs/frame-cadence-run.md` measured that offset against
+        // press-to-vsync over twenty runs and it predicts the input half of it
+        // exactly.
+        //
+        // ONLY THE LAST STEP, and the restriction is the whole of what makes
+        // this safe. The earlier steps of a catch-up simulate earlier time and
+        // have to stay behind: a key handed to one of them is back-dated onto a
+        // step that ran before the hand moved, which is the defect this queue
+        // exists for and which `products/web-player/tests/loop.js` pins in two
+        // claims. The last step is the one whose state the page is about to
+        // show, so it is the only one a player can feel.
+        //
+        // COUNTED HERE rather than taken from `due`, which is the same division
+        // written out above. It is read BEFORE the correction and this is read
+        // after it, and the correction adds a step or takes one, so `due` names
+        // a different number by now - the duplication is the point rather than
+        // an oversight.
+        //
+        // `Math.max` rather than `now` outright, and it is not defensive
+        // dressing. The constant advance runs a little AHEAD of the wall clock
+        // whenever the rate estimate reads fast, which `accumulator` above says
+        // is an ordinary state to be in; draining to `now` there would reach an
+        // instant earlier than today's boundary and make input latency worse on
+        // exactly the runs that are already fine.
+        //
+        // `Math.min` is the step cap in the `while` below, said again: a
+        // callback owing more than eight steps runs eight, and what is wanted is
+        // the last step that will RUN rather than the last one that was owed.
+        //
+        // A burst cut short by a rest never reaches this step at all and keeps
+        // today's boundary, which is wanted: the drop below says why in the same
+        // sentence - applying input up to `now` on the way into a rest latches
+        // an edge into a queue that is about to have nothing draining it.
+        const planned = Math.min (8, Math.floor (this.credit / this.display));
 
         // `held` is every step so far having reported `game_report_still`, which
         // is what the screen path can be skipped on: the canvas holds the last
@@ -5649,8 +7336,9 @@ class Clock {
 
         let stepped = 0, held = true, asked = false, rested = false;
 
-        while (this.accumulator >= 1 / this.rate && stepped < 8) {
-            this.input.applyUpTo (this.simTime);
+        while (this.credit >= this.display && stepped < 8) {
+            this.input.applyUpTo (stepped === planned - 1
+                ? Math.max (this.simTime, now) : this.simTime);
 
             const report = session.advance (this.input.buttons,
                 this.input.edges, this.input.pointer);
@@ -5670,6 +7358,7 @@ class Clock {
 
             this.simTime += 1000 / this.rate;
             this.accumulator -= 1 / this.rate;
+            this.credit -= this.display;
             stepped++;
 
             // The rest of this catch-up would be steps that change nothing, so
@@ -5680,20 +7369,33 @@ class Clock {
             if (report & REPORT.idle) { rested = true; break; }
         }
 
-        // The step cap was reached with work still owed, so this machine cannot
-        // keep up. Drop the backlog rather than carry it: left to accumulate,
+        // The backlog is past what a run can pay off promptly, so this machine
+        // cannot keep up. Drop it rather than carry it: left to accumulate,
         // simulated time falls permanently behind the wall clock, and every
         // queued key then has to wait out that lag before a step will take it.
         // Dropping costs some skipped frames, which is what a machine this far
         // behind was going to show anyway.
+        //
+        // TWO WAYS TO BE PAST IT, and under this rule the second is the usual
+        // one. The step cap was reached with credit still standing, which is a
+        // callback that owed more than eight steps. Or the deficit itself is
+        // over `BACKLOG` - a stall, a clamped tab switch - which a correction
+        // of one step a callback would otherwise spend a fifth of a second
+        // paying off with the game visibly behind the player's hands. Anything
+        // SHORTER than that is paid off rather than dropped, which is the trade
+        // this rule makes against the one before it: an 88 ms stall is worth
+        // 5.3 frames and is now caught up smoothly over five callbacks instead
+        // of being thrown away in one.
         //
         // Not when the break above was a game resting: the owed time is forgiven
         // on the way back out of rest instead, and applying input up to now here
         // would latch an edge into a queue that is about to have nothing
         // draining it.
 
-        if (! rested && this.accumulator >= 1 / this.rate) {
+        if (! rested && (this.credit >= this.display
+                || this.accumulator * this.rate > BACKLOG)) {
             this.accumulator = 0;
+            this.credit = 0;
             this.simTime = now;
             this.input.applyUpTo (this.simTime);
         }
@@ -5730,20 +7432,22 @@ class Clock {
 // is a worker now, so the page is awake while the game is not - and a worker is
 // a thing the page can end.
 //
-// WHAT IT WATCHES is a HEARTBEAT read on the page's own clock. The worker asks
-// the display for its own frames and posts one frame message per callback,
-// whether or not that instant owed a step, and the page runs an animation frame
-// of its own that posts nothing at all: it stamps each callback as the oldest
-// instant nothing has been heard since, and a frame message clears it. So the
-// question "is the simulation still there" is "has anything come back since the
-// oldest frame I read", which needs no clock but the page's own animation frame
-// and asks the worker for nothing it was not already going to say.
+// WHAT IT WATCHES is a HEARTBEAT read on the page's own clock. The page posts
+// one `tick` per animation frame and the worker answers each one with a frame
+// message, whether or not that instant owed a step; this rule stamps each
+// callback as the oldest instant nothing has been heard since, and a frame
+// message clears it. So the question "is the simulation still there" is "has
+// anything come back since the oldest tick I posted", which needs no clock but
+// the page's own animation frame.
 //
-// IT WAS A ROUND TRIP, and the two shapes are the same arithmetic under
-// different words: the page posted a timestamp per frame and the worker answered
-// each one. What changed is only who owns the clock - a page that no longer
-// steps the simulation has nothing to post, and a heartbeat the worker sends
-// anyway is the same evidence for free.
+// IT IS A ROUND TRIP AGAIN, AND THE ARITHMETIC HAS NEVER CHANGED THROUGH THREE
+// SHAPES. The page posted a timestamp per frame and the worker answered each
+// one; then the worker asked the display for its own frames and this rule read a
+// heartbeat it was sending anyway; and now the page posts the timestamp again,
+// because a worker's animation frame is not the display's in Safari and the
+// block above `class Clock` carries that reading. Nothing here waits on an
+// answer - `loop` posts and reads and blocks on neither - so the round trip
+// costs this rule exactly what the free heartbeat cost it.
 //
 // ARMED BY THE FIRST ANSWER, never before it. A worker that has not answered
 // yet is a worker still compiling the module, laying down an arena and running
@@ -5770,14 +7474,14 @@ class Clock {
 // BACKGROUND tab at p99.9 766 ms between ticks and a worst gap of 1,584 ms,
 // against 25.6 ms at p99.9 with the tab in front. A watchdog left armed through
 // `hidden` would report a hang every few seconds on a tab nobody is looking at,
-// terminate the run and lose it. A halt tells the worker to stop asking the
-// display for frames, so a halted run posts no heartbeat and owes no answer -
-// and the page's own frame loop stops with it, which is what forgets the
-// pending instant. `docs/runs/drawing-worker-run.md` (b) is the reading that
-// makes the first half load bearing: Chrome stops a hidden tab's worker
-// animation frame outright and Safari throttles it to about nine ticks a
-// second, so a watchdog left armed would be reading the browser rather than the
-// game.
+// terminate the run and lose it. A halt stops the page's own frame loop, which
+// is both halves in one move: no tick is posted, so the worker owes no answer,
+// and the pending instant is forgotten with the loop that stamped it.
+// `docs/runs/drawing-worker-run.md` (b) is why the halt reaches the worker at
+// all rather than being left implicit in the silence - Chrome stops a hidden
+// tab's worker animation frame outright and Safari throttles it to about nine
+// ticks a second, so a clock left running on that thread would be reading the
+// browser rather than the game, and `prime` is what puts it back.
 // ---------------------------------------------------------------------------
 
 // How long the page waits for an answer before it decides there will not be
@@ -5899,10 +7603,12 @@ function stallLine (stall, budget = WATCHDOG_MS) {
 // THE SAME ARITHMETIC AND A DIFFERENT VERDICT, which is the whole reason this
 // is a class beside `Watchdog` rather than a second instance of it. A
 // simulation that stops answering is the run ending and there is nothing else
-// to do about it; a renderer that stops answering is a thread holding a canvas
-// and an instance of a module, and the page can end it and build another while
-// the game plays on. That is what `docs/archived/render-worker-plan.md` bought
-// with a display frame of latency, and this is the half of it the page owns.
+// to do about it; a renderer that stops answering is a thread holding an
+// instance of a module and nothing a player can see, and the page can end it and
+// build another while the game plays on - going on committing the last picture
+// it was sent throughout, because the canvas is the page's. That is what
+// `docs/archived/render-worker-plan.md` bought with a display frame of latency,
+// and this is the half of it the page owns.
 //
 // IT COUNTS ONLY WHILE A PICTURE IS OWED, and that is the one rule `Watchdog`
 // does not have. The simulation publishes on a tick that stepped and did not
@@ -5910,20 +7616,30 @@ function stallLine (stall, budget = WATCHDOG_MS) {
 // moved and a halted page all publish nothing - and a renderer that has drawn
 // nothing because nothing was posted to it is idle rather than wedged. So the
 // question this asks is not "has anything come back" but "is the newest picture
-// the simulation published still undrawn", which is two frame numbers and their
-// difference. A renderer merely BEHIND is not wedged either: every draw clears
-// the wait, so what has to happen for this to fire is a whole budget in which a
-// published picture went undrawn and no heartbeat arrived at all.
+// the simulation published still uncommitted", which is two frame numbers and
+// their difference. A renderer merely BEHIND is not wedged either: every commit
+// of a new picture clears the wait, so what has to happen for this to fire is a
+// whole budget in which a published picture never reached the canvas.
+//
+// WHAT IT READS IS THE COMMIT rather than a claim from the thread it is
+// watching, which is what moving the canvas back to the page bought it for
+// nothing. `drew` used to be a message the renderer posted after writing its own
+// canvas; `commitPixels` in `player.html` calls it at the instant the page
+// writes the picture, so the number here is a picture on a screen rather than a
+// picture handed to a compositor on another thread. A re-commit of a picture
+// already committed says nothing, for this rule's own reason: it would clear a
+// wait the renderer still owes.
 //
 // ARMED BY THE RENDERER SAYING IT IS OPEN, which is `render.worker.js`'s
 // `ready` and the one place this differs from the watchdog above. That one arms
 // on its first ANSWER, because a simulation answers every display frame whether
-// or not it stepped; a renderer answers only when it has drawn, and the subject
-// this exists to catch is a renderer that never draws once - so an arming rule
-// that waited for a draw would be a rule that never fires on the only case that
-// matters. `ready` is posted when the instance is compiled and the canvas is in
-// hand, so everything before it - the worker's own fetch, its `importScripts`,
-// the compile - is outside this exactly as a `construct` is outside the other.
+// or not it stepped; a renderer sends nothing until it has rendered, and the
+// subject this exists to catch is a renderer that never renders once - so an
+// arming rule that waited for a picture would be a rule that never fires on the
+// only case that matters. `ready` is posted when the instance is compiled and
+// the channel is being listened to, so everything before it - the worker's own
+// fetch, its `importScripts`, the compile - is outside this exactly as a
+// `construct` is outside the other.
 //
 // ONE REPLACEMENT PER SESSION, and `replaced` is where that is remembered
 // rather than in the page, because it is a fact about the run and the page
@@ -5941,11 +7657,11 @@ class RenderWatch {
         this.armed = false;
 
         // The page's own timestamp on the oldest instant at which a published
-        // picture was undrawn, or null while the renderer is up to date.
+        // picture was uncommitted, or null while the renderer is up to date.
         this.pending = null;
 
         // The newest frame the simulation published a picture for, and the
-        // newest frame the renderer said it drew. Both are the frame COUNT the
+        // newest frame the page committed one for. Both are the frame COUNT the
         // simulation stamped the description with, so they are comparable, and
         // the second can only trail the first.
         this.shown = 0;
@@ -5955,7 +7671,7 @@ class RenderWatch {
         this.replaced = false;
     }
 
-    // The renderer has compiled its instance and holds the canvas.
+    // The renderer has compiled its instance and is listening to the channel.
     opened () { this.armed = true; }
 
     // The simulation published a picture for this frame. Read off the frame
@@ -5965,9 +7681,10 @@ class RenderWatch {
     // same fact twice.
     published (frame) { this.shown = frame; }
 
-    // And the renderer drew one, which is its heartbeat. What it clears is the
-    // wait rather than the debt: a renderer running a frame behind is alive,
-    // and the next callback stamps a new instant if it is still behind.
+    // And the page committed one, which is what stands in for a heartbeat. What
+    // it clears is the wait rather than the debt: a renderer running a frame
+    // behind is alive, and the next callback stamps a new instant if it is
+    // still behind.
     drew (frame) {
         this.drawn = frame;
         this.pending = null;
@@ -6032,6 +7749,46 @@ function renderStallLine (stall, budget = WATCHDOG_MS) {
         + `this was written. \`inspector shot --replay <that file> --budget `
         + `${budget} --out <a png>\` on the native plug-in reproduces it, at `
         + `frame ${stall.frame}.`;
+}
+
+// And what the page says when a worker THREW, which neither watchdog above can
+// tell from a hang and which is the third way a run ends.
+//
+// A dedicated worker goes on running after an uncaught exception, and both
+// heartbeats this page reads are posted only after the work they report has
+// completed - the simulation's after a tick, the renderer's after a draw - so an
+// exception inside either handler reads from here as SILENCE. The budget then
+// expires and a watchdog names a frame that never stopped: what the page would
+// print is the one thing it knows to be untrue. The browser hands the page the
+// message, the file and the line on the error event instead, so the sentence is
+// composed out of those and the two frame numbers, and neither watchdog has to
+// fire.
+//
+// BOTH FRAMES, because the thread that threw is not always the thread that was
+// behind. A renderer that threw leaves a simulation still stepping and a picture
+// frozen at the frame it stopped drawing, and the distance between the two
+// numbers is what says how long the page ran blind. The recording written beside
+// this reaches the simulation's, one past what it reported finishing, exactly as
+// `stallLine`'s caller composes it.
+//
+// The FILE is cut to its last path segment: an error event carries the whole URL
+// the worker was fetched from, which on the arcade is a host, a directory and a
+// script, and the only part of it a person reading a banner can act on is the
+// name of the file that is beside the page anyway.
+//
+// No command beside it, which is the difference from the two above. An exception
+// is not a frame that never came back, so replaying to the frame reproduces
+// nothing in particular - the file and the line are what a person has.
+// `products/web-player/tests/exception.js` runs it.
+function workerErrorLine (which, message, file, line, simFrame, renderFrame) {
+    const named = file ? String (file).split ('/').pop () : null;
+    const where = named ? ` at ${named}:${line}` : '';
+
+    return `the ${which} threw \`${message || 'an error'}\`${where}, while the `
+        + `simulation was running frame ${simFrame} and the renderer was `
+        + `drawing frame ${renderFrame}. The exception is the fault rather than `
+        + `a hang, so the run was ended without waiting for a watchdog and the `
+        + `recording beside this was written.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -6292,9 +8049,16 @@ const MIN_SCALE = 1;
 // the list for 15 css px - but it buys that on two devices at the price of a
 // threshold, a constant and a branch in every case that reads this, and the
 // rule stops being a sentence.
+//
+// `width` and `height` are the frame the module declared, the console's own
+// when it declared none, and every reading above was taken at the console's
+// own. A frame of another shape is fitted by whichever side runs out of room
+// first, and the other side is left with room to spare, which the page centres.
 const FILL_DENSITY = 2;
 
-function canvasScale (available, ratio, zoom) {
+function canvasScale (available, ratio, zoom, width = FRAME_WIDTH,
+    height = FRAME_HEIGHT)
+{
     const dpr = ratio > 0 ? ratio : 1;
 
     // A page that cannot say what its zoom is gets the old answer rather than
@@ -6314,15 +8078,16 @@ function canvasScale (available, ratio, zoom) {
     // `fits` because it is the CHOSEN dimension that has to be floored - the
     // other one has room to spare by definition.
     const exact = Math.max (MIN_SCALE, Math.min (
-        fits (available.width, FRAME_WIDTH),
-        fits (available.height, FRAME_HEIGHT)));
+        fits (available.width, width),
+        fits (available.height, height)));
 
     const whole = Math.max (MIN_SCALE, Math.floor (exact));
 
     const scale = dpr / page >= FILL_DENSITY ? exact : whole;
 
     // Exact by construction WHERE THE SCALE IS WHOLE: the CSS box times the
-    // ratio is `240 * scale`, a whole number of device pixels, so every console
+    // ratio is `width * scale` by `height * scale`, whole numbers of device
+    // pixels, so every console
     // pixel is a square block of them. The division can still be fractional in
     // CSS - a ratio of 2.25 makes it 106.67px - and a box of whole device
     // pixels is only on the grid it was sized for if it also STARTS on one,
@@ -6336,8 +8101,8 @@ function canvasScale (available, ratio, zoom) {
     // smaller than the difference it is no longer able to remove.
     return {
         scale,
-        width: FRAME_WIDTH * scale / dpr,
-        height: FRAME_HEIGHT * scale / dpr,
+        width: width * scale / dpr,
+        height: height * scale / dpr,
     };
 }
 
@@ -6350,9 +8115,17 @@ function canvasScale (available, ratio, zoom) {
 // padding inside a 1px border. Half of a fractional leftover is a quarter of a
 // CSS pixel, which at a ratio of 2 is half a device pixel, so the canvas lands
 // straddling a row of the grid. The browser resolves that by blending the top
-// row of the game with what is behind the canvas, which is the canvas's own
-// black background, and the result is a dark line along the top edge that
-// arrives with the information row and leaves with it.
+// row of the game with what is behind the canvas, and the edge goes soft.
+//
+// THE DARK LINE THIS WAS WRITTEN AGAINST WAS NOT THIS, and it outlived the
+// correction. What showed was the canvas's own black background, which the
+// browser paints to a different rect from the picture wherever an edge is off
+// the grid - and a snap cannot put an edge on the grid after a zoom, which
+// never refits, or on the far side of a box the fill left fractional. So the
+// background went instead, and `#screen` in `player.html` holds the readings.
+// Measured there too, and worth knowing before leaning on this: headless
+// Chrome already puts a canvas on whole device pixels when it paints, so at 1x
+// this correction moves the picture a whole pixel off the rect it reports.
 //
 // A reading rather than an even number of pixels of chrome, which was the other
 // way to fix it. Rounding the row to 30px puts the artefact away at a ratio of
@@ -6507,11 +8280,14 @@ function layoutChange (before, after) {
 // box is what a client coordinate is measured in.
 //
 // Clamped rather than merely floored, because `interface/game.h` promises a
-// game that `x` is below `game_frame_width` and `y` below `game_frame_height`
-// so that either may index a row or a column directly. A press captures, so
-// this is the live case rather than a guard against one: a drag off the canvas
-// keeps arriving here and reports the edge it left through.
-function pointerPixel (clientX, clientY, rect) {
+// game that `x` is below the frame's width and `y` below its height so that
+// either may index a row or a column directly. The pair is the one the module
+// declared, handed in by the page, and the console's own when nothing is. A
+// press captures, so this is the live case rather than a guard against one: a
+// drag off the canvas keeps arriving here and reports the edge it left through.
+function pointerPixel (clientX, clientY, rect, width = FRAME_WIDTH,
+    height = FRAME_HEIGHT)
+{
     // A canvas with no box has not been laid out, and there is no position to
     // report; the alternative is a division by zero reaching a game as NaN.
     if (! rect.width || ! rect.height) { return { x: 0, y: 0 }; }
@@ -6520,8 +8296,8 @@ function pointerPixel (clientX, clientY, rect) {
         Math.max (0, Math.min (limit - 1, Math.floor (offset * limit / span)));
 
     return {
-        x: pixel (clientX - rect.left, rect.width, FRAME_WIDTH),
-        y: pixel (clientY - rect.top, rect.height, FRAME_HEIGHT),
+        x: pixel (clientX - rect.left, rect.width, width),
+        y: pixel (clientY - rect.top, rect.height, height),
     };
 }
 
@@ -6734,21 +8510,19 @@ function theme (palette, background) {
     };
 }
 
-// The resource line: one row per READ a body made, in the order the results
-// carrying them reached the game.
+// The resource line: one row per LOAD a body made, in the order the answers
+// carrying them reached the game, and `committed` where the task that made it
+// answered rather than failed.
 //
-// It reads the COMPLETION LOG rather than a cache of what is resident, and the
-// difference is the design rather than a preference. Nothing is delivered any
-// more: a resource is bytes a body read and threw away, and what survives one
-// is the block the body wrote. So the question a watcher can be answered is
-// "what did this run's bodies read, and did the tasks that read them deliver" -
-// which is what these rows say, and `inspector dump --resources` says the same
-// thing keyed on the task rather than on the file.
+// It reads the COMPLETION LOG rather than the store, and the difference is the
+// question: "what did this run's bodies load, and did the tasks that loaded
+// them answer". The store's own rows - what the game holds now - are
+// `storeLine`'s.
 //
-// The log outlives the table on purpose. A `failed` task is retired at the
-// frame boundary after its result went out, so a run that ended up drawing its
-// fallback would have nothing left in the table to name the file it could not
-// read - which is the one thing whoever is watching most wants to know.
+// The log outlives the table on purpose. A failed task loads nothing, so a run
+// that ended up drawing its fallback would have nothing in the store to name
+// the file it could not load - which is the one thing whoever is watching most
+// wants to know.
 //
 // `none` is a run whose bodies read nothing, which is now something only a run
 // can say: nothing is declared in advance, so before the first step every game
@@ -6757,16 +8531,17 @@ function resourceLine (session) {
     if (! session.readLog.length) { return "none"; }
 
     return session.readLog.map (read =>
-        `${read.name} ${read.failed ? "failed" : "resident"}`).join (", ");
+        `${read.name} ${read.failed ? "failed" : "committed"}`).join (", ");
 }
 
-// The task line: the leak report, which is the live table rather than the log.
+// The task line: half of the leak report, which is the live table rather than
+// the log.
 //
 // One row per id the game is still holding, with what it has become. A row
-// reading `resident` long after its `finished` frame IS a block the game never
-// released - and nothing warns, exactly as `console_tasks` warns about nothing,
-// because the dump is for a reader who asked rather than a line on a run that
-// did not.
+// reading `succeeded` long after its `finished` frame IS a slot the game never
+// gave back - and nothing warns, exactly as `console_tasks` warns about
+// nothing, because the dump is for a reader who asked rather than a line on a
+// run that did not.
 function taskLine (session) {
     const table = session.taskTable ();
 
@@ -6774,6 +8549,24 @@ function taskLine (session) {
 
     return table.map (task =>
         `${task.id} ${task.name || "?"} ${task.state}`).join (", ");
+}
+
+// The store line: the other half, one row per resource the store holds - its
+// id, the file it came from, the calls its scope names, and `live` or the frame
+// its unload settled on. A row still `live` at the end of a run is a
+// `max_resource_count` slot the game never unloaded.
+function storeLine (session) {
+    const table = session.resourceTable ();
+
+    if (! table.length) { return "none"; }
+
+    const scopes = (scope) => ["game", "video", "audio"]
+        .filter ((name, bit) => scope & (1 << bit)).join ("+") || "0";
+
+    return table.map (row => `${row.id} ${row.file || "?"} `
+        + `${scopes (row.scope)} `
+        + `${row.unloaded === null ? "live" : `unloaded ${row.unloaded}`}`)
+        .join (", ");
 }
 
 // The controls line: what the game declared it reads, in the words the header
@@ -6882,8 +8675,11 @@ function fillLegends (row, controls, document) {
 
 if (typeof module !== "undefined") {
     module.exports = {
-        LAYOUT, CORE, NOTHING, LOADER, RUNNER,
-        NAME_MAX, FORMAT_MAX, PATH_MAX,
+        LAYOUT, CORE, NOTHING, LOADER, RUNNER, STORE, RENDERING, NO_STORE,
+        TRAMPOLINE_SLOTS, inertServices, callName, scopeWord, scopeMember,
+        askRefusal, loadRefusal,
+        commitRefusal, lockRefusal, unlockRefusal, holdingRefusal,
+        MAX_NAME_BYTES, MAX_FORMAT_BYTES, MAX_PATH_BYTES,
         RESOURCE_FORMAT_OFFSET, RESOURCE_PATH_OFFSET, RESOURCE_BYTES,
         PAIR, PAGE_KEYS, SEED_KEY, DAY_KEY, FRAME_WIDTH,
         FRAME_HEIGHT,
@@ -6892,17 +8688,19 @@ if (typeof module !== "undefined") {
         REPORT, WASM_MAGIC, MIN_SCALE,
         onRefusal, refuse, fetchModule, fetchTrampoline, fetchCore,
         installTrampoline, HostCore,
-        Session, Consumer, freshDeliveries,
+        Session, Consumer, publishResources, ResourceSpace, PLACEMENT_CHUNK,
         SAVE_KEY_PREFIX, SAVE_PERIOD, saveHex, SaveStore, watchStore,
         dayNumber,
         resourceBase, composeRun, queryArguments, argumentList,
         runTaskBody, TaskRunner, sizeClass,
         Input, pointerPixel, canvasScale, gridSnap, pageZoom, layoutChange,
-        halted, haltChange, Clock,
+        halted, silenced, haltChange, Clock,
+        REFRESH_RATES, RATE_WINDOW, DEADBAND, BACKLOG, refreshRate,
         WATCHDOG_MS, Watchdog, stallLine, RenderWatch, renderStallLine,
+        workerErrorLine,
         markText, openRecord, growRecord,
         paint, paletteEntries, luminance, contrast, theme, resourceLine,
-        taskLine, controlsLine, fillLegends,
+        taskLine, storeLine, controlsLine, fillLegends,
         consolePcm, decodeResource, resourceReader, stringAt,
     };
 }
