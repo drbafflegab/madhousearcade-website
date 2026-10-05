@@ -773,9 +773,13 @@ const PRINTABLE = /^[\x20-\x7e]*$/;
 
 // The keys this page KEEPS. `module` says which game this is and `resources`
 // says which bytes it plays against, and neither is an argument any more than a
-// filename typed at a shell is.
+// filename typed at a shell is. `scrub` is the third and the only one that is
+// chrome rather than a choice of game: `scrub=on` opens the pause into a bar
+// that shows the last thirty seconds again, which says how the page looks and
+// nothing about the run - so a recording made under it has no business
+// carrying it as a pair, and none does.
 //
-// TWO AND NOT THREE. `seed` was the third and is not held back here any more:
+// THREE AND NOT FOUR. `seed` was once one of them and is not held back here:
 // it is still this host's own term and still reaches `construct` as that call's
 // own parameter, but it RIDES THE QUERY as an ordinary pair and
 // `host_core_extract_seed` is where the spelling ends - so one grammar carries
@@ -786,7 +790,7 @@ const PRINTABLE = /^[\x20-\x7e]*$/;
 // declaration to match it against, so a key this game has never heard of is a
 // key for a harness, for a menu or for the next version of it, and the run
 // starts regardless.
-const PAGE_KEYS = ["module", "resources"];
+const PAGE_KEYS = ["module", "resources", "scrub"];
 const SEED_KEY = "seed";
 
 const FRAME_WIDTH = 240, FRAME_HEIGHT = 240;
@@ -5353,6 +5357,29 @@ function publishResources (publisher, held, call) {
     };
 }
 
+// Whether a description captured against `rows` can no longer be drawn
+// truthfully by a consumer holding `held`: some row its call may lock names an
+// id that consumer does not hold. `held` is the caller's Set as
+// `publishResources` keeps it, which is exactly "delivered and still named by
+// the live table", because that function deletes an id the table stops naming.
+//
+// It answers for an OLD description, which is the only kind that can fail it:
+// `sim.worker.js` keeps a ring of the last thirty seconds of descriptions for
+// the page to scrub, and a resource unloaded since a slot was captured is one
+// whose bytes the consumer may no longer hold at that address. No shipped game
+// can produce one - the only unload in the tree is game scope, in
+// `games/klondike/source/klondike.c` - so this is the floor until a game
+// unloads a sheet mid-run, and the scrubber refuses such a frame rather than
+// drawing it out of whatever the address holds now. Read rather than mutated,
+// unlike `publishResources`, because a scrub delivers nothing.
+function staleResources (rows, held, call) {
+    for (const row of rows) {
+        if ((row.scope & call) && ! held.has (row.id)) { return true; }
+    }
+
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Consumer: a second instance of the game's own module, handed bytes and asked
 // to render them.
@@ -5723,7 +5750,16 @@ class Consumer {
     // still here, dead: a renderer drawing a description captured before the
     // unload settled was published it live, and one captured after is refused
     // it. An id the table stops naming is forgotten here as well.
-    mirrorResources (rows) {
+    //
+    // EXCEPT WHEN TOLD TO KEEP, which is a scrubbed frame: a description the
+    // simulation captured seconds ago and posts again out of its ring, with
+    // the rows of THAT moment. Those rows lack every id loaded since, and a
+    // mirror that forgot them would drop bytes the simulation will never send
+    // again - its own record of what this instance holds still says held - so
+    // the first live frame after the scrub would draw them out of zeros. With
+    // `keep` the mirror is that old table for this one draw and `accepted` is
+    // left as it was; the live frame that ends the scrub forgets as usual.
+    mirrorResources (rows, keep = false) {
         if (! this.core) { return; }
 
         this.core.mirrorClear (this.store);
@@ -5736,6 +5772,8 @@ class Consumer {
             this.core.mirrorEntry (this.store, row.id, row.scope, row.size,
                 this.accepted.has (row.id) ? row.address : 0, row.dead);
         }
+
+        if (keep) { return; }
 
         for (const id of [...this.accepted]) {
             if (live.has (id)) { continue; }
@@ -6117,12 +6155,13 @@ function composeRun (search, roll, now, history) {
 // Its DECODING is what a browser does and is reproduced: `+` is a space and
 // `%NN` is a byte, both applied to the key and to the value.
 //
-// The two keys this page keeps are dropped here and never reach a game:
-// `module` says which game this is and `resources` says which bytes it plays
-// against, and neither is an argument any more than a filename typed at a shell
-// is. TWO and not three: a pair named `save` is passed through like any other,
-// because reserving it would say the address bar can address the store and
-// saves are deliberately not link-composable.
+// The three keys this page keeps are dropped here and never reach a game:
+// `module` says which game this is, `resources` says which bytes it plays
+// against and `scrub` says how the page shows a pause, and none of them is an
+// argument any more than a filename typed at a shell is. THREE and not four: a
+// pair named `save` is passed through like any other, because reserving it
+// would say the address bar can address the store and saves are deliberately
+// not link-composable.
 //
 // `seed` GOES IN WITH THE PAIRS AND COMES BACK OUT THROUGH THE RULEBOOK, which
 // is what this function gained when the key stopped being held back here.
@@ -7180,7 +7219,22 @@ class Clock {
         // is drained to the callback's own instant when that is later. `advance`
         // says why only that one, and the field is untouched by it.
         this.simTime = 0;
+
+        // How many of the console's frames one step is spread over: 1, or 2
+        // and 4 under the page's slow motion. The accumulator and the credit
+        // are fed a `divisor`th of what elapsed, so the game steps that much
+        // less often and every rule below runs unchanged on the slower feed -
+        // the deadband, the cap of eight and the backlog drop included. The
+        // credit stays an integer, because the console's 60 divides by both.
+        // The DISPLAY estimate is not divided, because it estimates the screen
+        // and the screen did not slow down; and `simTime` advances by a step's
+        // share of WALL time, so the input queue is drained to the instant a
+        // step stands for rather than falling further behind it every step.
+        this.divisor = 1;
     }
+
+    // Slow motion, set by `sim.worker.js`'s `tempo` case.
+    slow (divisor) { this.divisor = divisor; }
 
     // Forget the interval that has not been lived through, so the next
     // `advance` takes its own timestamp as the origin and owes nothing for the
@@ -7259,8 +7313,8 @@ class Clock {
         if (delta > 0.25) delta = 0.25;         // never spiral after a tab switch
 
         this.reads (delta);
-        this.accumulator += delta;
-        this.credit += this.rate;
+        this.accumulator += delta / this.divisor;
+        this.credit += this.rate / this.divisor;
 
         // THE RECONCILIATION, and it is read against what this callback is
         // ABOUT to spend rather than against what it has spent nothing of yet.
@@ -7356,7 +7410,7 @@ class Clock {
             // is the one that costs no `render_audio` call and no buffer.
             this.audio (report);
 
-            this.simTime += 1000 / this.rate;
+            this.simTime += 1000 * this.divisor / this.rate;
             this.accumulator -= 1 / this.rate;
             this.credit -= this.display;
             stepped++;
@@ -8688,7 +8742,8 @@ if (typeof module !== "undefined") {
         REPORT, WASM_MAGIC, MIN_SCALE,
         onRefusal, refuse, fetchModule, fetchTrampoline, fetchCore,
         installTrampoline, HostCore,
-        Session, Consumer, publishResources, ResourceSpace, PLACEMENT_CHUNK,
+        Session, Consumer, publishResources, staleResources,
+        ResourceSpace, PLACEMENT_CHUNK,
         SAVE_KEY_PREFIX, SAVE_PERIOD, saveHex, SaveStore, watchStore,
         dayNumber,
         resourceBase, composeRun, queryArguments, argumentList,

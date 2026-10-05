@@ -413,12 +413,19 @@ const draw = () => {
 // frame, because the frame that mattered has already happened: the page read
 // the display, posted the tick this description was stepped on, and will commit
 // the block this call is about to hand it.
+//
+// A SCRUBBED FRAME COMES DOWN THE SAME PATH, marked `scrub`: an old description
+// out of the simulation's ring with the rows it was captured against and no
+// bytes, because a scrub delivers nothing. The mirror is made that old table
+// without forgetting what this instance holds, since the rows lack every id
+// loaded since and the simulation will not send those bytes twice -
+// `Consumer.mirrorResources` says the rest.
 
 const receive = (said) => {
     if (! consumer) { return; }
 
     consumer.acceptResources (said.fresh);
-    consumer.mirrorResources (said.rows);
+    consumer.mirrorResources (said.rows, said.scrub === true);
 
     consumer.acceptDescriptions ({ videoState: said.videoState });
 

@@ -248,18 +248,38 @@ const soundOf = (session) => ({
     ...publishResources (session.publisher (), heldByAudio, CORE.scope.audio),
 });
 
+// How many times slower than the console's own rate the live game is being
+// played: 1, or 2 and 4 under the page's slow motion. The clock is what steps
+// slower; this is what tells the speaker to stretch each block to match, so a
+// block of 800 samples lasts as long as the step it belongs to now does. A
+// scrubbed tick is never stretched - the ring plays at sixty a second whatever
+// the live game is doing.
+let tempo = 1;
+
 const sound = () => {
     if (! audioPort) { audio = []; return; }
 
     for (const tick of audio) {
-        if (! tick) { audioPort.postMessage ({ silent: true }); continue; }
+        if (! tick) {
+            audioPort.postMessage ({ silent: true, stretch: tempo });
+
+            continue;
+        }
 
         // Written out rather than composed, so that the shape a worklet reads
         // is a shape a reader of this file can see - which is also what
         // `products/web-player/tests/worklet.js`'s seam check reads, field by
         // field, out of this source.
+        //
+        // `scrub` and `reverse` are false on every live tick and set only on a
+        // tick the scrubber below replays out of its ring: the worklet mirrors
+        // a scrubbed tick's rows without forgetting, and turns a reversed
+        // one's samples end for end. `stretch` is `tempo` above on a live tick
+        // and 1 on a scrubbed one.
         audioPort.postMessage (
-            { audioState: tick.audioState, fresh: tick.fresh, rows: tick.rows },
+            { audioState: tick.audioState, fresh: tick.fresh, rows: tick.rows,
+                scrub: tick.scrub === true, reverse: tick.reverse === true,
+                stretch: tick.scrub === true ? 1 : tempo },
             [tick.audioState.buffer,
                 ...tick.fresh.map (resource => resource.bytes.buffer)]);
     }
@@ -324,6 +344,137 @@ const present = (tick) => {
     if (! tick.stepped || tick.held) { return; }
 
     show ();
+};
+
+// ---------------------------------------------------------------------------
+// THE SCRUB RING: the last thirty seconds of what every step captured, kept so
+// that a paused page can show any of those frames again and sound them forward
+// or backward. `docs/archived/scrub-plan.md` is the design and the argument.
+//
+// DESCRIPTIONS, NOT PIXELS AND NOT STATE. A frame's picture is `render_video`
+// over its video description and the store as it stood at the capture, and its
+// sound is `render_audio` over its audio description, so a slot holds those two
+// and the rows they were captured against and nothing else: nothing is
+// snapshotted, nothing is stepped again, and a scrubbed frame is drawn by the
+// same consumer out of the same bytes it was drawn from the first time. 1,800
+// slots of `games/klondike`'s two descriptions is 5.3 MB, against 104 MB for
+// the indexed pixels of the same thirty seconds.
+//
+// HERE, because this is the one thread that sees every step: the renderer is
+// handed one description per TICK, and a tick may step eight times.
+//
+// ONLY UNDER `scrub` IN THE OPEN MESSAGE. A run opened without it allocates no
+// ring, copies nothing per step and answers no `scrub` message, which is what
+// keeps the ordinary player untouched.
+//
+// AND IT RECORDS NOTHING. The ring is read-only output: no message below steps
+// the session, queues an input, grows a log or posts a `frame` heartbeat, so a
+// recording marked after a scrub is the recording marked without one -
+// `web_player_scrubs_the_frame_it_showed` compares the two texts.
+// ---------------------------------------------------------------------------
+
+// Thirty seconds at the console's sixty frames, which is the owner's figure.
+const SCRUB_FRAMES = 1800;
+
+let ring = null;
+
+// The frame the page is looking at, between the floor and the head.
+let cursor = 0;
+
+// The byte stores are laid down once, a slot's span each, so that filling a
+// slot is two `set`s and allocates nothing but the rows; the rows are small,
+// and are taken exactly as `publishResources` maps them.
+const openRing = (session) => ({
+    videoSize: session.videoStateSize,
+    audioSize: session.audioStateSize,
+    video: new Uint8Array (SCRUB_FRAMES * session.videoStateSize),
+    audio: session.audioStateSize
+        ? new Uint8Array (SCRUB_FRAMES * session.audioStateSize) : null,
+    slots: Array.from ({ length: SCRUB_FRAMES },
+        () => ({ frame: -1, rows: [], sounds: false })),
+    head: 0,
+});
+
+// The oldest frame still held. Derived from the head, never stored, so the two
+// cannot disagree.
+const floorOf = () => Math.max (0, ring.head - SCRUB_FRAMES + 1);
+
+// What the step that just ran captured, copied into its slot. Called with that
+// step's report from both places a step is taken - the clock's per-step
+// callback and the pause's one step with the pointer away - and once at `open`
+// for frame 0, whose descriptions `construct` captured.
+//
+// THE AUDIO HALF FOLLOWS THE GAME AND NOT THE PORT. The live path pushes null
+// with no worklet to send to, so as to copy nothing for nobody; a slot keeps
+// the description whenever the game sounded that step, because whether a
+// worklet is listening is a fact about the page and a slot is a fact about the
+// run.
+const remember = (report) => {
+    if (! ring) { return; }
+
+    const frame = session.frameIndex;
+    const at = frame % SCRUB_FRAMES;
+    const slot = ring.slots [at];
+
+    ring.video.set (new Uint8Array (session.memory.buffer,
+        session.videoStatePtr, ring.videoSize), at * ring.videoSize);
+
+    slot.sounds = ring.audio !== null && session.sounds
+        && ! (report & REPORT.silent);
+
+    if (slot.sounds) {
+        ring.audio.set (new Uint8Array (session.memory.buffer,
+            session.audioStatePtr, ring.audioSize), at * ring.audioSize);
+    }
+
+    slot.rows = session.publisher ().resources ().map (row => ({ id: row.id,
+        scope: row.scope, size: row.size, address: row.address,
+        dead: row.dead }));
+
+    slot.frame = frame;
+    ring.head = frame;
+};
+
+// One slot's picture, posted to the renderer as `show` posts a live one, with
+// the slot's own rows, no bytes and `scrub` set so that the renderer mirrors
+// those rows without forgetting. False where the slot names a resource the
+// renderer no longer holds, which is posted nothing: `staleResources` in
+// `player.js` says why that is refused rather than drawn.
+const showSlot = (frame) => {
+    if (! screenPort) { return true; }
+
+    const at = frame % SCRUB_FRAMES;
+    const slot = ring.slots [at];
+
+    if (staleResources (slot.rows, heldByScreen, CORE.scope.video)) {
+        return false;
+    }
+
+    const videoState = ring.video.slice (at * ring.videoSize,
+        (at + 1) * ring.videoSize);
+
+    screenPort.postMessage ({ videoState, frame, fresh: [], rows: slot.rows,
+        scrub: true }, [videoState.buffer]);
+
+    return true;
+};
+
+// One slot's sound, in the shape `sound` posts: null - a silent tick - for a
+// step the game reported silent and for a slot naming a resource the worklet
+// no longer holds.
+const soundSlot = (frame, reverse) => {
+    const at = frame % SCRUB_FRAMES;
+    const slot = ring.slots [at];
+
+    if (! slot.sounds
+        || staleResources (slot.rows, heldByAudio, CORE.scope.audio))
+    {
+        return null;
+    }
+
+    return { audioState: ring.audio.slice (at * ring.audioSize,
+        (at + 1) * ring.audioSize), fresh: [], rows: slot.rows, scrub: true,
+        reverse };
 };
 
 // One display frame, read on the PAGE: what the clock owes the game, what the
@@ -701,9 +852,23 @@ self.onmessage = (event) => {
         // Nothing is copied at all with no worklet to send it to, which is what
         // the guard is: a page whose `addModule` failed pays no state copy a
         // step for a consumer that does not exist.
-        clock = new Clock (() => session, input,
-            (report) => audio.push (! audioPort || ! session.sounds
-                || report & REPORT.silent ? null : soundOf (session)));
+        //
+        // And the scrub ring, where the page asked for one, filled from the
+        // same callback because it is the one place that runs once per step
+        // with both descriptions in hand - and given frame 0 here, which is
+        // what `construct` captured and the oldest frame a short run can show.
+        ring = message.scrub === true ? openRing (session) : null;
+
+        remember (0);
+
+        clock = new Clock (() => session, input, (report) => {
+            remember (report);
+
+            audio.push (! audioPort || ! session.sounds
+                || report & REPORT.silent ? null : soundOf (session));
+        });
+
+        clock.slow (tempo);
 
         self.postMessage ({
             kind: 'opened',
@@ -906,6 +1071,10 @@ self.onmessage = (event) => {
 
                 input.clearEdges ();
 
+                // A step like any other, so the ring keeps it: the frame on the
+                // screen when the scrub bar opens is this one.
+                remember (report);
+
                 audio.push (! audioPort || ! session.sounds
                     || report & REPORT.silent ? null : soundOf (session));
             }
@@ -937,6 +1106,81 @@ self.onmessage = (event) => {
                 records: freshRecords (),
             });
         }
+
+        break;
+    }
+
+    // The page moving the cursor over the ring, while it holds the run paused.
+    // One kind and three spellings: `begin` puts the cursor at the head, `move`
+    // moves it by `move` frames, and `end` shows the head again with the live
+    // rows. Each is answered with `scrubbed`, which is its own kind rather
+    // than a `frame` because a heartbeat grows the page's record and answers
+    // its watchdog, and a scrubbed frame does neither.
+    //
+    // A MOVE SHOWS ONE FRAME AND MAY SOUND MANY. The picture is the frame the
+    // cursor lands on; with `sound` set, every slot passed on the way is posted
+    // to the worklet in the order it was passed, so a paced run feeds the
+    // speaker one description per frame exactly as live play does. A move
+    // toward the floor sounds each block reversed, which is read off the
+    // direction rather than off the message, so the two cannot disagree.
+    //
+    // `stale` is a picture refused, and the page draws its bar in the alarm
+    // colour for it; `staleResources` in `player.js` says when.
+    //
+    // Nothing at all with no session or no ring: a page that did not open the
+    // run with `scrub` is owed no answer, and gets none.
+    case 'scrub': {
+        if (! session || ! ring) { break; }
+
+        const floor = floorOf (), head = ring.head;
+
+        if (message.begin) {
+            cursor = head;
+
+            self.postMessage ({ kind: 'scrubbed', frame: cursor, floor, head });
+
+            break;
+        }
+
+        if (message.end) {
+            cursor = head;
+
+            // The live description and the live rows, through `show` itself,
+            // so the renderer's mirror is put back by the ordinary forgetting
+            // path. Nothing has stepped since the pause, so this is the head
+            // slot's picture.
+            show ();
+
+            self.postMessage ({ kind: 'scrubbed', end: true, frame: head,
+                floor, head });
+
+            break;
+        }
+
+        const from = Math.min (Math.max (cursor, floor), head);
+        const to = Math.min (Math.max (from + Math.trunc (message.move || 0),
+            floor), head);
+
+        if (message.sound) {
+            const step = to < from ? -1 : 1;
+
+            audio = [];
+
+            for (let frame = from + step; frame !== to + step && from !== to;
+                frame += step)
+            {
+                audio.push (soundSlot (frame, step < 0));
+            }
+
+            sound ();
+        }
+
+        cursor = to;
+
+        const shown = showSlot (to);
+
+        self.postMessage ({ kind: 'scrubbed', frame: to, floor, head,
+            ...(shown ? {} : { stale: true }) });
 
         break;
     }
@@ -977,6 +1221,23 @@ self.onmessage = (event) => {
 
         break;
 
+    // Slow motion, which the page asks for under `scrub=on`: the clock steps
+    // once every `divisor` of the console's frames and the speaker stretches
+    // each block by as much. Anything else is the console's own rate. No prime,
+    // because the accumulator only ever moves by what has elapsed since the
+    // last callback, and a change of rate between two is the rate from then on.
+    //
+    // HELD HERE AND NOT ON THE CLOCK ALONE, because the page posts it right
+    // behind `open` on every run and the clock may not exist yet when it
+    // lands: `open` hands it on to the clock it builds.
+    case 'tempo':
+        tempo = message.divisor === 2 || message.divisor === 4
+            ? message.divisor : 1;
+
+        if (clock) { clock.slow (tempo); }
+
+        break;
+
     // This host's own account of the run, which is what a session knows about
     // itself and no game is ever told: how many frames have gone, what its
     // bodies read and what became of each, and the task table as
@@ -1012,6 +1273,7 @@ self.onmessage = (event) => {
         if (session) { session.runner.stop (); }
 
         session = null;
+        ring = null;
 
         // And the two consumers' ends of the two channels, because the page's
         // own ends went to a worklet and a renderer that are about to be opened

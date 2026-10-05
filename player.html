@@ -273,13 +273,14 @@ onRefusal (showAlarm);
 // `player.js` holds that rule, the site-relative resolution it needs to survive
 // being served from a subdirectory, and the five values it refuses.
 //
-// `module` and `resources` are the whole of what this page KEEPS. EVERY OTHER
-// KEY IS THE GAME'S and is passed through as a `Game_Arg` pair: nothing on a
-// module says a word about arguments in advance, so there is no declaration to
-// match a key against and a key this game has never heard of is not an error -
-// it is a key for a harness, for a menu, or for the next version of the game,
-// and the run starts regardless. That is why the two above are listed rather
-// than left to be inferred from what happens to be read here.
+// `module` and `resources` are the whole of what this page KEEPS about which
+// run this is, and `scrub` below is the one key it keeps about how it looks.
+// EVERY OTHER KEY IS THE GAME'S and is passed through as a `Game_Arg` pair:
+// nothing on a module says a word about arguments in advance, so there is no
+// declaration to match a key against and a key this game has never heard of is
+// not an error - it is a key for a harness, for a menu, or for the next version
+// of the game, and the run starts regardless. That is why the three are listed
+// rather than left to be inferred from what happens to be read here.
 //
 // `seed` is this host's own term and is NOT one of them: it rides the query as
 // an ordinary pair and the rulebook takes it back out below, so one grammar
@@ -413,6 +414,186 @@ const probing = query.get ("probe") === "present";
 const replayUrl = probing ? query.get ("replay") : null;
 
 let replayText = null;
+
+// ---------------------------------------------------------------------------
+// The scrub bar, which is off unless the address says otherwise.
+//
+// `?scrub=on` makes the pause a place to look back from: the simulation keeps
+// the last thirty seconds of what every step captured, and while the run is
+// paused the page moves a cursor over that ring - the arrows step a frame each
+// way, a held arrow plays at sixty frames a second with the sound forward or
+// backward, and `Shift` goes a second a tap and eight frames a frame held,
+// silently. The ring, the cursor and the four messages are `sim.worker.js`'s,
+// under its `scrub` case; nothing here steps the game, queues a press or grows
+// the record, so a run scrubbed and a run not scrubbed mark the same file.
+//
+// SPLIT THE WAY THE PROBE IS. The keyboard and the pacing are here, beside the
+// handlers they guard, because they decide what a key MEANS and a key must not
+// wait on a fetch to stop meaning something to the game. The bar itself - its
+// style, its track, the pointer that drags along it and the label that names
+// a new tempo - is `scrub.js`, fetched at the bottom of this script and only
+// under the key, so an ordinary load neither fetches nor parses any of it;
+// the hooks below ask whether its functions are there yet rather than
+// assuming.
+// ---------------------------------------------------------------------------
+
+const scrubbing = query.get ("scrub") === "on";
+
+// The newest answer the simulation gave about the cursor - `frame`, `floor`,
+// `head` and `stale` - or null while the bar is shut.
+let scrubAt = null;
+
+// The arrow being held, the timer that turns a tap into a run 500 ms on, and
+// the run itself once it has started: which way, how many frames a due frame
+// is worth, whether it sounds, the animation-frame instant it started at and
+// how many due frames it has posted.
+let scrubKey = null;
+let scrubTimer = null;
+let scrubRun = null;
+
+// How slowly the live game is being played: 1, 2 or 4 console frames a step.
+// `S` cycles it under `scrub=on`, whether or not the bar is open, and it
+// outlives a pause, a resume and `R` alike - a person slowing a run down to
+// see it go wrong again wants the next run slow too. The simulation's `tempo`
+// case is the clock's half and the speaker's, and the label that names the
+// new speed for a moment after each press is `scrub.js`'s.
+let scrubTempo = 1;
+
+const SCRUB_HOLD_MS = 500;
+const SCRUB_SHIFT_TAP = 60;
+const SCRUB_SHIFT_RATE = 8;
+
+// The bar opens with the pause. Posted AFTER the pause's own shed, so on a game
+// that reads a pointer the step that sends it away is in the ring before the
+// cursor is put at the head: messages to one worker arrive in the order sent.
+function scrubBegin () {
+    post ({ kind: "scrub", begin: true });
+}
+
+// And closes with the resume, BEFORE the prime: the head's picture goes back up
+// with the live rows, and the next tick steps from there.
+function scrubEnd () {
+    scrubRelease ();
+
+    scrubAt = null;
+
+    post ({ kind: "scrub", end: true });
+
+    if (typeof scrubHide === "function") { scrubHide (); }
+}
+
+// The next tempo round the cycle, posted to the run that is playing.
+function scrubSlow () {
+    scrubTempo = scrubTempo === 1 ? 2 : scrubTempo === 2 ? 4 : 1;
+
+    post ({ kind: "tempo", divisor: scrubTempo });
+
+    // And the tempo said for a moment, over the picture, which is `scrub.js`'s.
+    if (typeof scrubTempoShown === "function") { scrubTempoShown (scrubTempo); }
+}
+
+// One move of the cursor, sounded or not. The simulation clamps it to what the
+// ring holds and answers with where it landed.
+function scrubMove (frames, sound) {
+    post ({ kind: "scrub", move: frames, sound });
+}
+
+// A held arrow becoming a run, 500 ms after it went down. The first animation
+// frame after this is the run's zero, so the first frame it owes is one
+// display frame on rather than one sixtieth of a second early.
+//
+// THE SOUND IS RESUMED HERE and put away when the run ends, because the pause
+// suspended it and a tap must stay silent. That is outside the key's handler,
+// half a second after the gesture; the context was running before the pause,
+// so this is a resume of one the page itself suspended, and the hand readings
+// in both browsers are what say that is allowed.
+function scrubHold (direction, shift) {
+    scrubTimer = null;
+
+    scrubRun = { direction, rate: shift ? SCRUB_SHIFT_RATE : 1,
+        sound: ! shift, started: null, sent: 0 };
+
+    if (scrubRun.sound && synth) { cancelAudioRest (); synth.resume (); }
+}
+
+// The arrow let go, or the bar shut under it: no timer, no run, and the sound
+// put back where the pause left it.
+function scrubRelease () {
+    if (scrubTimer !== null) { clearTimeout (scrubTimer); }
+
+    scrubTimer = null;
+    scrubKey = null;
+
+    if (scrubRun && scrubRun.sound && synth && halt.paused) {
+        cancelAudioRest ();
+        synth.ctx.suspend ();
+    }
+
+    scrubRun = null;
+}
+
+// A key while the bar is open: true where it was the bar's to take. An arrow
+// moves the cursor at once - a tap is one frame, or a second with `Shift` -
+// and arms the timer; every other console key is swallowed, so nothing typed
+// while looking back is queued for the first step after the resume.
+function scrubKeyDown (event) {
+    const direction = event.code === "ArrowLeft" ? -1
+        : event.code === "ArrowRight" ? 1 : 0;
+
+    if (direction === 0) { return KEYS [event.code] !== undefined; }
+
+    if (event.repeat) { return true; }
+
+    scrubRelease ();
+
+    scrubKey = event.code;
+
+    scrubMove (direction * (event.shiftKey ? SCRUB_SHIFT_TAP : 1), false);
+
+    const shift = event.shiftKey;
+
+    scrubTimer = setTimeout (() => scrubHold (direction, shift),
+        SCRUB_HOLD_MS);
+
+    return true;
+}
+
+// The pacing, on the page's own animation frame. Plain arithmetic rather than
+// the `Clock`, because the clock steps the session and the whole of this is
+// that nothing steps: frames due since the run started, less what has been
+// posted, which on a 120 Hz display alternates nothing and one.
+function scrubPace (now) {
+    if (! scrubRun) { return; }
+
+    if (scrubRun.started === null) { scrubRun.started = now; }
+
+    const due = Math.floor ((now - scrubRun.started) * FRAME_RATE / 1000)
+        - scrubRun.sent;
+
+    if (due <= 0) { return; }
+
+    scrubRun.sent += due;
+
+    scrubMove (due * scrubRun.rate * scrubRun.direction, scrubRun.sound);
+}
+
+// Where the cursor landed. A run that has reached the end it was heading for
+// stops there, which is also what puts the sound away. An answer that arrives
+// after the bar shut - a pause and a resume inside one round trip - is about a
+// bar nobody is looking at, and opens nothing.
+function scrubLanded (message) {
+    if (message.end || ! halt.paused) { return; }
+
+    scrubAt = message;
+
+    if (scrubRun && message.frame === (scrubRun.direction < 0
+        ? message.floor : message.head))
+    {
+        scrubRelease ();
+    }
+
+    if (typeof scrubShown === "function") { scrubShown (message); }
+}
 
 // ---------------------------------------------------------------------------
 // Audio. The game renders its own samples, ON THE AUDIO THREAD.
@@ -577,8 +758,8 @@ class StatePlayer extends AudioWorkletProcessor {
         // Ticks arrive from the simulation's own thread and are consumed on the
         // audio clock. A queue absorbs the difference. What it holds is state
         // blocks rather than samples now, and the entry for a tick a game
-        // reported silent is the silence below - so an entry is one tick of
-        // TIME whichever kind it is.
+        // reported silent is marked silent and plays the silence below - so
+        // an entry is one tick of TIME whichever kind it is.
         this.queue = [];
         this.pending = null;
         this.pendingAt = 0;
@@ -590,9 +771,14 @@ class StatePlayer extends AudioWorkletProcessor {
         // Sharing one array across several queued ticks is safe because nothing
         // here ever writes to it and each entry is consumed on its own cursor,
         // so two entries that are the same array play as two frames of silence.
-        // It doubles as the SENTINEL saying which kind an entry is, which is why
-        // next below compares against it by identity.
+        // It used to double as the queue's sentinel for a silent entry; an
+        // entry carries its own stretch now, so a silent one is an object
+        // marked silent and this is only what it plays.
         this.silence = new Int16Array (SAMPLES_PER_FRAME);
+
+        // How many output samples each sample of the block now playing is
+        // held for: the stretch its tick was posted with.
+        this.stretch = 1;
 
         // Where a rendered tick is copied to, once per tick. The game renders
         // into its own linear memory at the same address every time and
@@ -843,10 +1029,30 @@ class StatePlayer extends AudioWorkletProcessor {
             // samples early and the next sound would arrive ahead of the frame
             // it belongs to. A sounding tick keeps the rows it was published
             // with, which is the table its description was captured against.
+            //
+            // A SCRUBBED tick is an old description out of the simulation's
+            // ring, played while the page holds the run paused: its rows are
+            // mirrored without forgetting what this instance holds, because
+            // they lack every id loaded since and nothing would send those
+            // bytes again, and one played BACKWARD carries reverse, which turns
+            // the 800 samples it renders end for end. Both are false on every
+            // live tick.
+            //
+            // And every tick, sounded or silent, says how many frames it is
+            // spread over: 1 at the console's own rate, 2 or 4 while the page
+            // plays the game in slow motion and each step lasts that many
+            // frames. A block stretched by as much lasts as long as its step
+            // does, so the queue neither starves nor floods at any tempo.
+            const stretch = message.data.stretch === 2
+                || message.data.stretch === 4 ? message.data.stretch : 1;
+
             this.queue.push (message.data.silent
-                ? this.silence
+                ? { silent: true, stretch }
                 : { audioState: message.data.audioState,
-                    rows: message.data.rows || [] });
+                    rows: message.data.rows || [],
+                    keep: message.data.scrub === true,
+                    reverse: message.data.reverse === true,
+                    stretch });
 
             // A producer far ahead is a stall that already happened, and its
             // backlog is latency nothing gives back. Cut to QUEUE_TICKS on every
@@ -903,8 +1109,10 @@ class StatePlayer extends AudioWorkletProcessor {
         this.rules.host_core_unlock (this.store, id);
     }
 
-    // The mirror, made the table a tick's description was captured against.
-    mirror (rows) {
+    // The mirror, made the table a tick's description was captured against,
+    // and left holding every id it has accepted when told to keep - which is
+    // the scrubbed tick above, and player.js's Consumer says the rest.
+    mirror (rows, keep) {
         if (! this.rules) { return; }
 
         this.rules.host_core_mirror_clear (this.store);
@@ -918,6 +1126,8 @@ class StatePlayer extends AudioWorkletProcessor {
                 row.size, this.accepted.has (row.id) ? row.address : 0,
                 row.dead ? 1 : 0);
         }
+
+        if (keep) { return; }
 
         for (const id of [...this.accepted]) {
             if (! live.has (id)) { this.accepted.delete (id); }
@@ -937,11 +1147,13 @@ class StatePlayer extends AudioWorkletProcessor {
 
         if (! entry) { return null; }
 
-        if (entry === this.silence || ! this.renderAudio) {
+        this.stretch = entry.stretch;
+
+        if (entry.silent || ! this.renderAudio) {
             return this.silence;
         }
 
-        this.mirror (entry.rows);
+        this.mirror (entry.rows, entry.keep);
 
         new Uint8Array (this.memory.buffer, this.description,
             entry.audioState.length).set (entry.audioState);
@@ -961,6 +1173,12 @@ class StatePlayer extends AudioWorkletProcessor {
         this.rendered.set (new Int16Array (this.memory.buffer,
             this.samplesPtr, SAMPLES_PER_FRAME));
 
+        // Rendered forward and then turned end for end, because the block is
+        // the atom: render_audio is pure over the description, so this is the
+        // frame's own sound played backward, where reversing only the ORDER of
+        // blocks would play 13 ms of forward sound sixty times a second.
+        if (entry.reverse) { this.rendered.reverse (); }
+
         return this.rendered;
     }
 
@@ -971,12 +1189,21 @@ class StatePlayer extends AudioWorkletProcessor {
         // never line up: a tick is rendered when the reader reaches it and
         // handed over a quantum at a time.
         for (let i = 0; i < out.length; i++) {
-            if (! this.pending || this.pendingAt >= this.pending.length) {
+            if (! this.pending
+                || this.pendingAt >= this.pending.length * this.stretch)
+            {
                 this.pending = this.next ();
                 this.pendingAt = 0;
             }
 
-            out [i] = this.pending ? this.pending [this.pendingAt++] / 32768 : 0;
+            // Each sample held for as many output samples as the tick is
+            // stretched, which is the block played slower by as much: a
+            // sample and hold, so a tone drops by the same factor and nothing
+            // is invented between two samples the game rendered.
+            out [i] = this.pending
+                ? this.pending [Math.floor (this.pendingAt++ / this.stretch)]
+                    / 32768
+                : 0;
         }
 
         return true;
@@ -1321,6 +1548,42 @@ addEventListener ("keydown", event => {
         return;
     }
 
+    // UNDER `scrub=on`, ESCAPE IS THE BAR - but only while the page is not
+    // fullscreen, which is the rule above kept rather than broken. In
+    // fullscreen the key is the browser's and leaves fullscreen, and the
+    // keydown that comes with that exit arrives while `fullscreenElement` is
+    // still set, so it opens nothing; the next Escape, in a window, does. Not
+    // on a repeat, because an Escape held through that exit repeats once the
+    // window is back and would open and shut the bar at the key rate.
+    if (event.code === "Escape" && scrubbing && ! event.repeat
+        && ! document.fullscreenElement)
+    {
+        togglePause ();
+        event.preventDefault ();
+
+        return;
+    }
+
+    // And `S` is slow motion under the same key, which takes it from WASD's
+    // `down` there and nowhere else: a game played with the arrows loses
+    // nothing, and one played with WASD is played without the key.
+    if (event.code === "KeyS" && scrubbing) {
+        if (! event.repeat) { scrubSlow (); }
+
+        event.preventDefault ();
+
+        return;
+    }
+
+    // And while the bar is open the arrows are the cursor's and no console key
+    // reaches the game: a press queued now would apply on the first step after
+    // the resume, to a frame nobody was looking at when it was typed.
+    if (scrubbing && halt.paused && scrubKeyDown (event)) {
+        event.preventDefault ();
+
+        return;
+    }
+
     // `KEYS` rather than the queue's answer, and it is the same question asked
     // one step earlier: `Input.queue` refuses a code this console has no button
     // for and reports it, and the page needs that report NOW to decide whether
@@ -1335,6 +1598,11 @@ addEventListener ("keydown", event => {
     event.preventDefault ();
 });
 addEventListener ("keyup", event => {
+    // The held arrow let go ends its run. The release is still forwarded below,
+    // as every release is: one is never harmful, and a key that was down when
+    // the bar opened has to be able to let go.
+    if (scrubbing && event.code === scrubKey) { scrubRelease (); }
+
     if (! KEYS [event.code]) { return; }
 
     wake ();
@@ -1569,7 +1837,9 @@ function available () {
     // it goes with it, and a gap charged unconditionally would keep taking 14px
     // from a canvas that is now the only thing in the flow. Written over a list
     // because the page had two of these rows until the identity row went, and
-    // one row is the case this arithmetic gets wrong when it is assumed.
+    // one row is the case this arithmetic gets wrong when it is assumed. The
+    // scrub bar is not one of them: it floats over the canvas's bottom edge
+    // and takes no room in the flow.
     const rows = [hud].filter (row => ! row.hidden);
 
     const vertical = rows.reduce (
@@ -2553,6 +2823,10 @@ function reset () {
         // compose this field from nothing but the probe's own query.
         replay: replayText,
 
+        // Whether the simulation keeps the scrub bar's ring, which is
+        // allocated and filled only where the address said `scrub=on`.
+        scrub: scrubbing,
+
         // AND NOTHING ABOUT TIME, which is what moving the clock here took off
         // this message. It used to carry `performance.timeOrigin`, because a
         // dedicated worker's clock counts from its own creation and the worker
@@ -2564,6 +2838,12 @@ function reset () {
         // halted at birth; a thread that steps on what this page posts does not,
         // because a halted page reaches `loop` and posts nothing.
     });
+
+    // The slow motion `S` chose, carried into the new run: a new thread starts
+    // at the console's rate and is told otherwise right behind its `open`.
+    if (scrubbing && scrubTempo !== 1) {
+        sim.postMessage ({ kind: "tempo", divisor: scrubTempo });
+    }
 
     // The channel the sound will take, made here and given away in two
     // directions: one end goes to the simulation now, and the other to the
@@ -2660,6 +2940,12 @@ function fromSim (message) {
         openRender (message.layout, message.resident);
         openAudio (message.layout, message.resident);
 
+        // A run opened under a pause - `R` pressed with the bar open, or
+        // `Enter` before the module landed - opens the bar on its own ring,
+        // because no pause is going to arrive to do it. A run of the old ring
+        // still under way is let go first: its frames are not this ring's.
+        if (scrubbing && halt.paused) { scrubRelease (); scrubBegin (); }
+
         break;
 
     case "frame": {
@@ -2752,6 +3038,14 @@ function fromSim (message) {
     // A task became ready under a game whose state had no other reason to move.
     case "wake":
         wake ();
+
+        break;
+
+    // Where the scrub bar's cursor landed, which is NOT a frame: no step ran,
+    // so there is nothing to grow the record by and nothing for the watchdog
+    // to have been waiting on, and neither is touched.
+    case "scrubbed":
+        scrubLanded (message);
 
         break;
 
@@ -3035,6 +3329,17 @@ function setHalt (change) {
         stepPointerAway ();
     }
     else if (shed) { post ({ kind: "shed", how: shed }); }
+
+    // Under `scrub=on` the pause IS the bar, whichever of `Enter`, the button
+    // or `Escape` moved it. Here for both halves because here is the one
+    // ordering both need: the bar opens after the shed above has posted the
+    // step that sends the pointer away, so the head includes it, and it shuts
+    // before the prime below, so the head's picture is back up with the live
+    // rows when the clock starts again. `redraw` stays where it is: it and the
+    // head's show both end with the head drawn whichever lands first.
+    if (scrubbing && before.paused !== halt.paused) {
+        if (halt.paused) { scrubBegin (); } else { scrubEnd (); }
+    }
 
     applyCursor ();
 
@@ -3402,6 +3707,11 @@ function loop (now) {
     // the clock, for the reason above.
     commitPixels ();
 
+    // And a held arrow on the scrub bar, which is paced on this callback
+    // because it is the display's and the bar is only ever open while nothing
+    // steps - so it sits above the return a halted page takes.
+    if (scrubRun) { scrubPace (now); }
+
     if (! stepping) { return; }
 
     // Whether anything has come back since the last time this asked. Here rather
@@ -3522,7 +3832,13 @@ function start ([bytes, host, rules]) {
     // a node.
     synth = new Synth ();
 
-    const unlock = () => synth.resume ();
+    // Except while the scrub bar is open, where the sound is the bar's to start
+    // and stop: an arrow tapped there must stay silent, and a context this
+    // resumed on it would play out whatever the pause cut off and then run on
+    // until the resume.
+    const unlock = () => {
+        if (! (scrubbing && halt.paused)) { synth.resume (); }
+    };
 
     // Two properties, and the fullscreen key cost a bug for want of each.
     //
@@ -3589,6 +3905,18 @@ if (probing) {
     const script = document.createElement ("script");
 
     script.src = new URL ("probe.js", location.href).href;
+
+    document.body.appendChild (script);
+}
+
+// And the scrub bar's, by the same argument: fetched only under its key, a
+// classic script for the shared globals, and appended rather than awaited -
+// the keys above work without it, and the bar it draws is asked after rather
+// than assumed.
+if (scrubbing) {
+    const script = document.createElement ("script");
+
+    script.src = new URL ("scrub.js", location.href).href;
 
     document.body.appendChild (script);
 }
