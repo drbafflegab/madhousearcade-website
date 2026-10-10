@@ -275,7 +275,7 @@ onRefusal (showAlarm);
 //
 // `module` and `resources` are the whole of what this page KEEPS about which
 // run this is, and `scrub` below is the one key it keeps about how it looks.
-// EVERY OTHER KEY IS THE GAME'S and is passed through as a `Game_Arg` pair:
+// EVERY OTHER KEY IS THE GAME'S and is passed through as a `Game_Pair`:
 // nothing on a module says a word about arguments in advance, so there is no
 // declaration to match a key against and a key this game has never heard of is
 // not an error - it is a key for a harness, for a menu, or for the next version
@@ -416,6 +416,39 @@ const replayUrl = probing ? query.get ("replay") : null;
 let replayText = null;
 
 // ---------------------------------------------------------------------------
+// A run started from a recording, which is off unless the address says
+// otherwise.
+//
+// `?resume=message` opens no run until a page of this site hands it one: the
+// page posts `{ kind: "arcade-resume-ready" }` to its parent and waits for
+// `{ kind: "arcade-resume", text }`, and the recording in `text` is replayed
+// on the simulation's thread up to its `frame` line, undrawn and unheard, and
+// then played on by the hand - `sim.worker.js`'s `forward` is what that means.
+// It is what a tuner's snapshot is restored through, and one message carries
+// a snapshot taken in the tuner and a `.replay` file loaded into it alike.
+//
+// `resumeText` is the recording, kept for `R`, which starts the same moment
+// again; a second `arcade-resume` replaces it and resets onto it.
+// `forwarding` is true from a reset to the hand-over, while there is no run
+// the hand can record yet.
+//
+// A RESUMED RUN WRITES NO SAVE. The store is the player's progress in the real
+// game, and a run rebuilt from a recording is a developer's run replayed, so
+// every blob the simulation posts is dropped rather than kept - before the
+// hand-over and after it.
+// ---------------------------------------------------------------------------
+
+const resuming = query.get ("resume") === "message";
+
+let resumeText = null;
+let resumeArrived = null;
+let forwarding = false;
+
+// The hash of the newest description the simulation posted, which is what the
+// recording this page answers a request with names as the picture it ends on.
+let runHash = null;
+
+// ---------------------------------------------------------------------------
 // The scrub bar, which is off unless the address says otherwise.
 //
 // `?scrub=on` makes the pause a place to look back from: the simulation keeps
@@ -503,10 +536,12 @@ function scrubMove (frames, sound) {
 // display frame on rather than one sixtieth of a second early.
 //
 // THE SOUND IS RESUMED HERE and put away when the run ends, because the pause
-// suspended it and a tap must stay silent. That is outside the key's handler,
-// half a second after the gesture; the context was running before the pause,
-// so this is a resume of one the page itself suspended, and the hand readings
-// in both browsers are what say that is allowed.
+// put it away and a tap must stay silent. That is outside the key's handler,
+// half a second after the gesture, and what it resumes is the fresh context
+// the put-away built, which has never run. The hand readings in both browsers
+// were of a context the page had suspended after it ran, so they do not say
+// this is allowed - and a browser that refuses it scrubs in silence, because
+// the unlock `start` installs stands aside while the bar is open.
 function scrubHold (direction, shift) {
     scrubTimer = null;
 
@@ -525,8 +560,7 @@ function scrubRelease () {
     scrubKey = null;
 
     if (scrubRun && scrubRun.sound && synth && halt.paused) {
-        cancelAudioRest ();
-        synth.ctx.suspend ();
+        replaceSpeaker ();
     }
 
     scrubRun = null;
@@ -636,7 +670,8 @@ function scrubLanded (message) {
 // - A `WebAssembly.Module` will NOT deserialize into an
 //   `AudioWorkletGlobalScope`: posted to the port it arrives at
 //   `onmessageerror`. The module's BYTES cross, and `new WebAssembly.Module`
-//   compiles synchronously off the main thread - (c). So bytes are posted.
+//   compiled them there synchronously, off the main thread - (c). So bytes are
+//   posted, and `WebAssembly.compile` takes them now, asynchronously.
 // - A `MessagePort` DOES cross, and a dedicated worker on the far end of one
 //   feeds the audio thread with no main thread on the path - measured for this
 //   milestone by `scratch/probes/port.sh`, three ticks from a worker straight
@@ -657,7 +692,6 @@ const STATE_PLAYER = `
 const SAMPLES_PER_FRAME = ${SAMPLES_PER_FRAME};
 
 const GAME_RENDER_AUDIO = ${LAYOUT.game.renderAudio};
-const GAME_AUDIO_STATE_SIZE = ${LAYOUT.game.audioStateSize};
 const GAME_BYTES = ${LAYOUT.game.bytes};
 
 // Game_Resource_Store's offsets, Game_Data's, the seven trampoline slots in the
@@ -730,6 +764,20 @@ const STORE_CONTEXT = 0x30000000;
 // growing back is a lag controller this tree has deferred whole.
 const QUEUE_TICKS = 3;
 
+// How long a gap between the starts of two quanta has to be before process
+// reports it to the page as a stall, in milliseconds. A JUDGEMENT, to be
+// revisited from what the log shows: the second Safari reading had the
+// longest ordinary gap at 3 to 6 ms (Chrome 6 to 7), and a stall adds about
+// its own length as delay - a 100 ms hold added 95 ms - so 20 is clear of the
+// one and well short of a sound anybody hears as late.
+// docs/archived/fresh-speaker-plan.md section 8 holds both readings.
+const STALL_MS = 20;
+
+// And how long after a context's first quantum a gap is marked as startup:
+// the probe saw 27 ms in the first moments after a start, so the two are told
+// apart rather than either silenced.
+const STARTUP_MS = 1000;
+
 // The consumer, on the audio thread. It never calls construct and never calls
 // step: what it holds is bytes it was handed plus whatever the module's own
 // data segments put there, and what it runs on them is the game's own
@@ -741,16 +789,22 @@ const QUEUE_TICKS = 3;
 // the rows every tick carries. A renderer calls no host function but lock and
 // unlock, and those are answered out of that mirror by the same entry points
 // the simulation's store answers out of. What it costs this scope is two more
-// WebAssembly.Modules compiled here, out of bytes rather than out of modules,
-// for the reason the game's is: a Module will not deserialize into an
+// modules compiled here, out of bytes rather than out of modules, for the
+// reason the game's is: a Module will not deserialize into an
 // AudioWorkletGlobalScope and bytes cross without complaint. It happens once
-// per run, before anything is playing.
+// per run, asynchronously, before anything is playing.
 //
 // THERE IS NO RUN TO END FROM THE AUDIO THREAD, so a lock the mirror refuses
 // answers no bytes and a render_audio that returns holding one is let go of:
 // what a game draws for a resource it cannot reach is 800 samples of whatever it
 // sounds without one. The refusal a run ends on is the render worker's, which
 // holds the same mirror and can say so.
+//
+// AND NOTHING HERE CAN STALL THE THREAD IT RUNS ON once the run is open: the
+// memory is grown once, in open, and never again, and a tick allocates nothing
+// this class can avoid. What it cannot avoid is the message objects the
+// browser builds on receipt, and a report of a stall, which is the one thing
+// process ever posts.
 class StatePlayer extends AudioWorkletProcessor {
     constructor () {
         super ();
@@ -760,7 +814,21 @@ class StatePlayer extends AudioWorkletProcessor {
         // blocks rather than samples now, and the entry for a tick a game
         // reported silent is marked silent and plays the silence below - so
         // an entry is one tick of TIME whichever kind it is.
-        this.queue = [];
+        //
+        // A RING OF ENTRIES MADE HERE AND REUSED, so a tick allocates none:
+        // QUEUE_TICKS + 1 of them, because the trim runs after every push and
+        // the push is the one moment the queue is a tick past its target.
+        // head is the oldest entry and count how many are queued.
+        this.ring = [];
+
+        for (let index = 0; index <= QUEUE_TICKS; index++) {
+            this.ring.push ({ silent: false, audioState: null, rows: null,
+                keep: false, reverse: false, stretch: 1 });
+        }
+
+        this.head = 0;
+        this.count = 0;
+
         this.pending = null;
         this.pendingAt = 0;
 
@@ -772,7 +840,7 @@ class StatePlayer extends AudioWorkletProcessor {
         // here ever writes to it and each entry is consumed on its own cursor,
         // so two entries that are the same array play as two frames of silence.
         // It used to double as the queue's sentinel for a silent entry; an
-        // entry carries its own stretch now, so a silent one is an object
+        // entry carries its own stretch now, so a silent one is an entry
         // marked silent and this is only what it plays.
         this.silence = new Int16Array (SAMPLES_PER_FRAME);
 
@@ -781,21 +849,49 @@ class StatePlayer extends AudioWorkletProcessor {
         this.stretch = 1;
 
         // Where a rendered tick is copied to, once per tick. The game renders
-        // into its own linear memory at the same address every time and
-        // memory.grow detaches every view over a buffer, so a view kept across a
-        // delivery would be a view of nothing; 800 shorts is 44 ns, measured.
+        // into its own linear memory at the same address every time; 800
+        // shorts is 44 ns, measured.
         this.rendered = new Int16Array (SAMPLES_PER_FRAME);
 
         this.instance = null;
+        this.memory = null;
         this.renderAudio = null;
         this.states = null;
 
+        // The views over the memory, made once the run is open and made again
+        // only if the buffer under them is not the one they were made over.
+        // memory.grow detaches every view over a buffer, and nothing after open
+        // grows this one, so they are made once a run - and checked all the
+        // same, because a view over a detached buffer reads nothing.
+        this.buffer = null;
+        this.bytes = null;
+        this.view = null;
+        this.samples = null;
+
+        // Where open grew the memory to, which is where the simulation's
+        // reserved resource spaces end: no region or resource this instance is
+        // handed lies past it.
+        this.end = 0;
+
         // The resources whose bytes this instance has been handed, by id, and
-        // the mirror a lock here is answered out of. An id rather than an
-        // address because the simulation's arena recycles a block once the
-        // table stops naming it, so one address carries one resource and then
-        // another.
-        this.accepted = new Set ();
+        // the ADDRESS each was written at - which is what a lock is answered
+        // with, mirror below says why. By id rather than by address because
+        // the simulation's arena recycles a block once the table stops naming
+        // it, so one address carries one resource and then another.
+        this.accepted = new Map ();
+
+        // The ids a tick's rows name, and what forgets an accepted id they do
+        // not: one Set cleared per tick and one callback, both made here.
+        this.live = new Set ();
+
+        this.forget = (address, id) => {
+            if (! this.live.has (id)) { this.accepted.delete (id); }
+        };
+
+        // Whether the page has been told of a resource refused for lying past
+        // the end - once an instance, because a host that misplaces one has a
+        // defect rather than an accident.
+        this.told = false;
 
         this.rules = null;
         this.store = 0;
@@ -803,10 +899,17 @@ class StatePlayer extends AudioWorkletProcessor {
         this.closeAt = 0;
         this.storePtr = 0;
         this.call = 0;
+        this.rulesBuffer = null;
+        this.answers = null;
 
         // Where the sound description lands. Settled in open below and read
         // once per tick.
         this.description = 0;
+
+        // When the last quantum started and when the first did, by Date.now:
+        // performance is not exposed in this scope. -1 before the first.
+        this.last = -1;
+        this.first = 0;
 
         // The page opens a run: the module's bytes, the trampoline's and the
         // rulebook's bytes, the addresses its simulation laid down, the regions
@@ -819,58 +922,95 @@ class StatePlayer extends AudioWorkletProcessor {
         };
     }
 
-    // Enough linear memory for span bytes at at, which is the whole of what
-    // this class does for itself: it lays no arena down, and every address it
-    // uses arrived in the layout its simulation published.
-    room (at, span) {
-        const need = at + span;
-        const have = this.memory.buffer.byteLength;
+    // The views above, made again only over a new buffer.
+    views () {
+        const buffer = this.memory.buffer;
 
-        if (need <= have) { return; }
+        if (buffer === this.buffer) { return; }
 
-        this.memory.grow (Math.ceil ((need - have) / 65536));
+        this.buffer = buffer;
+        this.bytes = new Uint8Array (buffer);
+        this.view = new DataView (buffer);
+        this.samples = new Int16Array (buffer, this.samplesPtr,
+            SAMPLES_PER_FRAME);
     }
 
-    // One region of the simulation's memory, written at its own address.
+    // And the one over the rulebook's memory, which a lock's answer is read out
+    // of, on the same rule.
+    answered () {
+        const buffer = this.rules.memory.buffer;
+
+        if (buffer !== this.rulesBuffer) {
+            this.rulesBuffer = buffer;
+            this.answers = new DataView (buffer);
+        }
+
+        return this.answers;
+    }
+
+    // One region or resource of the simulation's memory, written at its own
+    // address into memory open has already grown. False, and nothing written,
+    // where it would reach past the end open grew to: that is a host bug,
+    // because everything a speaker is handed lies below the end by
+    // construction, and growing for it here would be a memory.grow on the
+    // audio thread.
     accept (address, bytes) {
-        if (! this.instance || ! bytes || ! bytes.length) { return; }
+        if (! bytes || address + bytes.length > this.end) { return false; }
 
-        this.room (address, bytes.length);
+        this.views ();
 
-        new Uint8Array (this.memory.buffer, address, bytes.length).set (bytes);
+        this.bytes.set (bytes, address);
+
+        return true;
     }
 
-    open (bytes, trampolineBytes, coreBytes, layout, regions, port) {
-        // THE MODULE'S BYTES RATHER THAN THE MODULE. A WebAssembly.Module will
-        // not deserialize into this scope - posted to the port above it arrives
-        // at onmessageerror - and the bytes cross without complaint, where
-        // new WebAssembly.Module compiles synchronously off the main thread at
-        // any size. It happens once per run, before anything is playing.
-        const instance = new WebAssembly.Instance (
-            new WebAssembly.Module (bytes), {});
+    // And the page told of one, once. Nothing is thrown: there is no run to end
+    // from here, and what is refused reads as not held, so the game sounds
+    // without it.
+    refuse (id, address, size) {
+        if (this.told) { return; }
+
+        this.told = true;
+
+        this.port.postMessage ({ refused: id, address, size, end: this.end });
+    }
+
+    // THE COMPILES ARE ASYNCHRONOUS, all three together, so the engine is free
+    // to do them on threads of its own while this one only awaits. Whether it
+    // does is the engine's business and is not measured here; what holds either
+    // way is phase 2b's rule, that the page starts the context only on the
+    // opened this posts last, so nothing is rendered while any of it runs.
+    // Ticks that arrive meanwhile wait in their port, which is taken last.
+    async open (bytes, trampolineBytes, coreBytes, layout, regions, port) {
+        const linked = trampolineBytes && coreBytes && layout.store;
+
+        const host = {
+            spawn: () => 0,
+            status: () => 0,
+            finalize: () => {},
+            load: () => 0,
+            unload: () => {},
+            lock: (answerAt, context, id) =>
+                this.lock (answerAt, context, id),
+            unlock: (context, id) => this.unlock (context, id),
+        };
+
+        const [game, core, shim] = await Promise.all ([
+            WebAssembly.compile (bytes),
+            linked ? WebAssembly.compile (coreBytes) : null,
+            linked ? WebAssembly.compile (trampolineBytes) : null,
+        ]);
+
+        const [instance, rulebook, trampoline] = await Promise.all ([
+            WebAssembly.instantiate (game, {}),
+            core ? WebAssembly.instantiate (core, {}) : null,
+            shim ? WebAssembly.instantiate (shim, { host }) : null,
+        ]);
 
         const ex = instance.exports;
 
         this.instance = instance;
         this.memory = ex.memory;
-
-        // The descriptor, off THIS instance's own factory rather than taken
-        // from the simulation's: the function pointer on it is an index into
-        // this instance's own table. factory writes host memory at an address
-        // the simulation also spent on host memory, so nothing a state can
-        // reference is touched.
-        this.room (layout.game, GAME_BYTES);
-
-        new Uint8Array (this.memory.buffer, layout.game, GAME_BYTES).fill (0);
-
-        ex.factory (layout.game);
-
-        const view = new DataView (this.memory.buffer);
-
-        const audioAt = view.getUint32 (layout.game + GAME_RENDER_AUDIO, true);
-
-        const audioStateSize =
-            view.getUint32 (layout.game + GAME_AUDIO_STATE_SIZE, true);
 
         this.samplesPtr = layout.samples;
 
@@ -881,14 +1021,36 @@ class StatePlayer extends AudioWorkletProcessor {
         // reach the line that reads this.
         this.description = layout.audioState;
 
-        // Room for both blocks in one go, and the audio block is also the answer
-        // to where this processor's own 1,600 bytes of scratch go: at the
-        // address the simulation's own arena gave its Game_Audio_Block, which by
-        // construction overlaps no state and no output, because that arena
-        // is what laid all three down.
-        this.room (layout.samples, SAMPLES_PER_FRAME * 2);
+        // THE ONE GROWTH, to where the simulation's reserved resource spaces
+        // end. Its arena lays everything this instance is told about below
+        // that - the descriptor, the samples, the description, the store's
+        // record, the regions - and every resource the speaker may lock lies in
+        // one of those spaces, at an address known now. So no message after
+        // this one makes this memory grow, and accept refuses rather than
+        // grows.
+        this.end = layout.resourceSpaceEnd >>> 0;
 
-        if (audioStateSize) { this.room (layout.audioState, audioStateSize); }
+        const have = this.memory.buffer.byteLength;
+
+        if (this.end > have) {
+            this.memory.grow (Math.ceil ((this.end - have) / 65536));
+        }
+
+        this.views ();
+
+        // The descriptor, off THIS instance's own factory rather than taken
+        // from the simulation's: the function pointer on it is an index into
+        // this instance's own table. factory writes host memory at an address
+        // the simulation also spent on host memory, so nothing a state can
+        // reference is touched.
+        this.bytes.fill (0, layout.game, layout.game + GAME_BYTES);
+
+        ex.factory (layout.game);
+
+        this.views ();
+
+        const audioAt =
+            this.view.getUint32 (layout.game + GAME_RENDER_AUDIO, true);
 
         // The two wasm functions this instance needs of its own, the record
         // that names them, and the mirror they answer out of. The record's
@@ -905,9 +1067,8 @@ class StatePlayer extends AudioWorkletProcessor {
         this.storePtr = 0;
         this.rules = null;
 
-        if (trampolineBytes && coreBytes && layout.store) {
-            const rules = new WebAssembly.Instance (
-                new WebAssembly.Module (coreBytes), {}).exports;
+        if (linked) {
+            const rules = rulebook.exports;
 
             let heap = rules.__heap_base.value ?? rules.__heap_base;
 
@@ -934,11 +1095,11 @@ class StatePlayer extends AudioWorkletProcessor {
             // The module's byte figures, which bound nothing in a mirror -
             // this instance commits nothing - and travel so that a store is
             // laid out from the same declarations wherever it is laid out.
-            const bytes = layout.maxResourceBytes ?? {};
+            const declared = layout.maxResourceBytes ?? {};
 
-            const gameBytes = bytes.game >>> 0;
-            const videoBytes = bytes.video >>> 0;
-            const audioBytes = bytes.audio >>> 0;
+            const gameBytes = declared.game >>> 0;
+            const videoBytes = declared.video >>> 0;
+            const audioBytes = declared.audio >>> 0;
 
             this.store = rules.host_core_resources_begin (alloc (
                 rules.host_core_resources_size (maxResourceCount, maxTaskCount,
@@ -950,44 +1111,30 @@ class StatePlayer extends AudioWorkletProcessor {
             this.closeAt = alloc (CLOSED_BYTES);
             this.rules = rules;
 
+            // The view a lock's answer is read through, made here rather than
+            // by the first lock, which is on the audio thread.
+            this.answered ();
+
             const table = ex.__indirect_function_table;
             const at = table.grow (TRAMPOLINE_SLOTS.length);
 
-            const host = {
-                spawn: () => 0,
-                status: () => 0,
-                finalize: () => {},
-                load: () => 0,
-                unload: () => {},
-                lock: (answerAt, context, id) =>
-                    this.lock (answerAt, context, id),
-                unlock: (context, id) => this.unlock (context, id),
-            };
-
-            const shim = new WebAssembly.Instance (
-                new WebAssembly.Module (trampolineBytes), { host });
-
             TRAMPOLINE_SLOTS.forEach ((name, index) => {
-                table.set (at + index, shim.exports [name]);
+                table.set (at + index, trampoline.exports [name]);
             });
 
-            this.room (layout.store, STORE_BYTES);
-
-            const compose = new DataView (this.memory.buffer);
-
-            compose.setUint32 (layout.store + STORE_CONTEXT_AT, STORE_CONTEXT,
+            this.view.setUint32 (layout.store + STORE_CONTEXT_AT, STORE_CONTEXT,
                 true);
-            compose.setUint32 (layout.store + STORE_LOCK_AT,
+            this.view.setUint32 (layout.store + STORE_LOCK_AT,
                 at + TRAMPOLINE_SLOTS.indexOf ('lock'), true);
-            compose.setUint32 (layout.store + STORE_UNLOCK_AT,
+            this.view.setUint32 (layout.store + STORE_UNLOCK_AT,
                 at + TRAMPOLINE_SLOTS.indexOf ('unlock'), true);
 
             this.storePtr = layout.store;
         }
 
-        // AFTER the growth, because a table entry is a function and survives one
-        // where a view would not. Null is a game that declares no render_audio,
-        // and every tick of one plays as the silence above.
+        // A table entry is a function and survives a growth where a view would
+        // not. Null is a game that declares no render_audio, and every tick of
+        // one plays as the silence above.
         this.renderAudio = audioAt
             ? ex.__indirect_function_table.get (audioAt) : null;
 
@@ -996,14 +1143,18 @@ class StatePlayer extends AudioWorkletProcessor {
         // hold a pointer into either, so both are here before the first state
         // can be rendered.
         for (const region of regions || []) {
-            this.accept (region.address, region.bytes);
+            if (! this.accept (region.address, region.bytes)) {
+                this.refuse (0, region.address,
+                    region.bytes ? region.bytes.length : 0);
+            }
         }
 
         // A new run is a new linear memory on both sides, so whatever this queue
         // was holding belongs to a session that no longer exists. This is not
         // the drain the comment above refuses - that one emptied a queue mid-run
         // and robbed it of its cushion; this is the queue of the run that ended.
-        this.queue.length = 0;
+        this.head = 0;
+        this.count = 0;
         this.pending = null;
         this.pendingAt = 0;
 
@@ -1012,17 +1163,32 @@ class StatePlayer extends AudioWorkletProcessor {
         this.states = port;
 
         // The handler that runs on the audio thread, and it has to stay trivial:
-        // one branch, one push, one splice.
+        // two branches, one entry filled and the trim. Indexed loops and
+        // reused entries, so that it allocates nothing of its own.
         this.states.onmessage = (message) => {
             // The resources scoped for render_audio this instance has not been
             // handed, at their own addresses AND under their own ids, taken on
             // receipt rather than when the tick is rendered: a tick trimmed off
             // the queue below must not take bytes a later tick names with it.
-            for (const resource of message.data.fresh || []) {
-                this.accept (resource.address, resource.bytes);
+            const fresh = message.data.fresh;
 
-                this.accepted.add (resource.id);
+            for (let index = 0; fresh && index < fresh.length; index++) {
+                const resource = fresh [index];
+
+                if (this.accept (resource.address, resource.bytes)) {
+                    this.accepted.set (resource.id, resource.address);
+                } else {
+                    this.refuse (resource.id, resource.address,
+                        resource.bytes ? resource.bytes.length : 0);
+                }
             }
+
+            // A DELIVERY IS NOT A TICK. It is the bytes alone, handed to a
+            // speaker the page has just built in place of one it put away -
+            // every resource the live table names for render_audio, which the
+            // closed instance held and this one does not. A tick is time and a
+            // delivery is not, so it fills no entry and trims nothing.
+            if (message.data.delivery) { return; }
 
             // A silent tick takes a queue slot like any other, because what the
             // queue really holds is TIME. Dropped instead, it would drain 800
@@ -1046,13 +1212,17 @@ class StatePlayer extends AudioWorkletProcessor {
             const stretch = message.data.stretch === 2
                 || message.data.stretch === 4 ? message.data.stretch : 1;
 
-            this.queue.push (message.data.silent
-                ? { silent: true, stretch }
-                : { audioState: message.data.audioState,
-                    rows: message.data.rows || [],
-                    keep: message.data.scrub === true,
-                    reverse: message.data.reverse === true,
-                    stretch });
+            const entry =
+                this.ring [(this.head + this.count) % this.ring.length];
+
+            entry.silent = !! message.data.silent;
+            entry.audioState = message.data.audioState;
+            entry.rows = message.data.rows;
+            entry.keep = message.data.scrub === true;
+            entry.reverse = message.data.reverse === true;
+            entry.stretch = stretch;
+
+            this.count++;
 
             // A producer far ahead is a stall that already happened, and its
             // backlog is latency nothing gives back. Cut to QUEUE_TICKS on every
@@ -1060,15 +1230,27 @@ class StatePlayer extends AudioWorkletProcessor {
             // makes it self correcting: a catch-up of eight steps leaves the
             // queue at three rather than at eight.
             //
-            // The OLDEST go, and that is what keeps the sound with the picture:
-            // the ticks dropped are the ones already late, and the ones kept are
-            // the ones about to be drawn. It also costs nothing to drop one now,
-            // because the samples have not been rendered yet - which is one
-            // thing this shape buys that a queue of buffers could not.
-            if (this.queue.length > QUEUE_TICKS) {
-                this.queue.splice (0, this.queue.length - QUEUE_TICKS);
+            // The OLDEST go, off the ring's head, and that is what keeps the
+            // sound with the picture: the ticks dropped are the ones already
+            // late, and the ones kept are the ones about to be drawn. It also
+            // costs nothing to drop one now, because the samples have not been
+            // rendered yet - which is one thing this shape buys that a queue of
+            // buffers could not.
+            if (this.count > QUEUE_TICKS) {
+                this.head = (this.head + this.count - QUEUE_TICKS)
+                    % this.ring.length;
+                this.count = QUEUE_TICKS;
             }
         };
+
+        // AND THE PAGE IS TOLD, which is the one thing this says to it about a
+        // run. The page builds every context suspended and starts it only on
+        // this, so everything above runs on an audio thread with nothing to
+        // play: a context running through it is a stall, and Safari keeps a
+        // stall as delay until the context is replaced. LAST, because the page
+        // may start the clock the moment this leaves, and everything a quantum
+        // reads - the instance, the regions, the port - is in place by now.
+        this.port.postMessage ({ opened: true });
     }
 
     // What Game_Resource_Store's lock is here, which with unlock is the whole
@@ -1076,16 +1258,7 @@ class StatePlayer extends AudioWorkletProcessor {
     // written as a Game_Data at the hidden pointer a wasm32 struct return goes
     // through, and zeros for every refusal - there is no run to end from here.
     lock (answerAt, context, id) {
-        const put = (bytes, size) => {
-            if (! answerAt) { return; }
-
-            const view = new DataView (this.memory.buffer);
-
-            view.setUint32 ((answerAt >>> 0) + DATA_BYTES_AT, bytes >>> 0, true);
-            view.setUint32 ((answerAt >>> 0) + DATA_SIZE_AT, size >>> 0, true);
-        };
-
-        put (0, 0);
+        this.put (answerAt, 0, 0);
 
         if (context !== STORE_CONTEXT || ! this.call || ! this.rules) {
             return;
@@ -1093,14 +1266,25 @@ class StatePlayer extends AudioWorkletProcessor {
 
         this.rules.host_core_lock (this.store, id, this.lockAt);
 
-        const answer = new DataView (this.rules.memory.buffer);
+        const answer = this.answered ();
 
         if (answer.getInt32 (this.lockAt + LOCKED.verdict, true) !== LOCK_TAKEN) {
             return;
         }
 
-        put (answer.getUint32 (this.lockAt + LOCKED.bytes, true),
+        this.put (answerAt, answer.getUint32 (this.lockAt + LOCKED.bytes, true),
             answer.getUint32 (this.lockAt + LOCKED.size, true));
+    }
+
+    put (answerAt, bytes, size) {
+        if (! answerAt) { return; }
+
+        this.views ();
+
+        const at = answerAt >>> 0;
+
+        this.view.setUint32 (at + DATA_BYTES_AT, bytes >>> 0, true);
+        this.view.setUint32 (at + DATA_SIZE_AT, size >>> 0, true);
     }
 
     unlock (context, id) {
@@ -1112,26 +1296,33 @@ class StatePlayer extends AudioWorkletProcessor {
     // The mirror, made the table a tick's description was captured against,
     // and left holding every id it has accepted when told to keep - which is
     // the scrubbed tick above, and player.js's Consumer says the rest.
+    //
+    // A ROW IS ANSWERED FROM WHERE THIS INSTANCE HOLDS THE BYTES, not from the
+    // address it names. The simulation's space moves a resource when it
+    // compacts and hands it over again at the new address, so a tick queued
+    // before the move names the address it has left - which a second compaction
+    // can fill with another resource. A resource is never written, so its bytes
+    // are the same wherever they were put, and where they were put is accepted.
     mirror (rows, keep) {
         if (! this.rules) { return; }
 
         this.rules.host_core_mirror_clear (this.store);
 
-        const live = new Set ();
+        this.live.clear ();
 
-        for (const row of rows) {
-            live.add (row.id);
+        for (let index = 0; rows && index < rows.length; index++) {
+            const row = rows [index];
+            const at = this.accepted.get (row.id);
+
+            this.live.add (row.id);
 
             this.rules.host_core_mirror_entry (this.store, row.id, row.scope,
-                row.size, this.accepted.has (row.id) ? row.address : 0,
-                row.dead ? 1 : 0);
+                row.size, at === undefined ? 0 : at, row.dead ? 1 : 0);
         }
 
         if (keep) { return; }
 
-        for (const id of [...this.accepted]) {
-            if (! live.has (id)) { this.accepted.delete (id); }
-        }
+        this.accepted.forEach (this.forget);
     }
 
     // The next tick's 800 samples, rendered HERE: the game's own render_audio,
@@ -1143,9 +1334,12 @@ class StatePlayer extends AudioWorkletProcessor {
     // what it means to sound, so inventing samples would be the host making
     // something up.
     next () {
-        const entry = this.queue.shift ();
+        if (this.count === 0) { return null; }
 
-        if (! entry) { return null; }
+        const entry = this.ring [this.head];
+
+        this.head = (this.head + 1) % this.ring.length;
+        this.count--;
 
         this.stretch = entry.stretch;
 
@@ -1155,8 +1349,9 @@ class StatePlayer extends AudioWorkletProcessor {
 
         this.mirror (entry.rows, entry.keep);
 
-        new Uint8Array (this.memory.buffer, this.description,
-            entry.audioState.length).set (entry.audioState);
+        this.views ();
+
+        this.bytes.set (entry.audioState, this.description);
 
         this.call = AUDIO_CALL;
 
@@ -1170,8 +1365,9 @@ class StatePlayer extends AudioWorkletProcessor {
             this.rules.host_core_close_call (this.store, this.closeAt);
         }
 
-        this.rendered.set (new Int16Array (this.memory.buffer,
-            this.samplesPtr, SAMPLES_PER_FRAME));
+        this.views ();
+
+        this.rendered.set (this.samples);
 
         // Rendered forward and then turned end for end, because the block is
         // the atom: render_audio is pure over the description, so this is the
@@ -1182,7 +1378,30 @@ class StatePlayer extends AudioWorkletProcessor {
         return this.rendered;
     }
 
+    // EVERY STALL THIS THREAD SEES, reported to the page: the gap between the
+    // starts of two quanta, where one is longer than STALL_MS. A context is
+    // never resumed once it has rendered - every put-away closes it and a fresh
+    // one starts - so within one context's life any such gap is a stall; one
+    // the browser interrupted on its own would read as one too. A gap that
+    // starts within STARTUP_MS of the first quantum is marked as startup. The
+    // message allocates, which nothing else here does per quantum, and only on
+    // a stall.
+    watch () {
+        const now = Date.now ();
+
+        if (this.last < 0) {
+            this.first = now;
+        } else if (now - this.last > STALL_MS) {
+            this.port.postMessage ({ stall: now - this.last,
+                startup: this.last - this.first < STARTUP_MS });
+        }
+
+        this.last = now;
+    }
+
     process (inputs, outputs) {
+        this.watch ();
+
         const out = outputs [0] [0];
 
         // A render quantum is 128 samples and a console frame is 800, so the two
@@ -1213,52 +1432,182 @@ class StatePlayer extends AudioWorkletProcessor {
 registerProcessor ('states', StatePlayer);
 `;
 
+// What a `Synth` has already said on this page. Every put-away builds another
+// on the same device in the same browser, which would find what the first one
+// found and say it again on every pause, so each warning is said once a page.
+const synthSaid = new Set ();
+
+function synthWarn (about, ...words) {
+    if (synthSaid.has (about)) { return; }
+
+    synthSaid.add (about);
+
+    console.warn (...words);
+}
+
+// A stall the worklet saw on the audio thread, said in one line every time it
+// is reported and never otherwise: a gap that long between two quanta can leave
+// the sound as far behind the picture, and only a put-away clears it. The frame
+// is the one this page was last handed to show, so a late sound heard on a
+// frame can be matched to the stall before it.
+function speakerStalled (ms, startup) {
+    console.warn (`player: the audio thread stalled ${ms} ms`
+        + `${startup ? " at startup" : ""} (frame ${shownFrame}); the sound `
+        + "may now trail the picture by up to that much until it is next put "
+        + "away");
+}
+
+// The audio context and the worklet in it, which is to say the speaker.
+//
+// ONE PER PUT-AWAY AND PER RUN rather than one per page. The page used to build
+// this once and suspend its context whenever the sound was put away; it closes
+// the context and builds another in its place now, which `replaceSpeaker`
+// argues, so a `Synth` lives from one put-away, or one `reset`, to the next.
+//
+// EVERY ONE IS BUILT SUSPENDED AND RUNS ONLY ONCE ITS RUN IS OPEN. The worklet
+// compiles and instantiates three modules when it is handed a run, and a
+// context running through that is a stall Safari keeps as delay. So `resume`
+// says the page wants the sound, and the context is resumed on the later of
+// that and the worklet's `opened`.
+//
+// AND ITS CONTEXT IS BUILT ONLY ONCE ITS PREDECESSOR'S HAS CLOSED. `previous`
+// is what that predecessor's `close` answered, or null for the first; a
+// `Synth` put away before then never builds a context at all.
 class Synth {
-    constructor () {
-        this.ctx = new (window.AudioContext || window.webkitAudioContext)
-            ({ sampleRate: SAMPLE_RATE });
+    constructor (previous = null) {
+        this.previous = previous;
 
-        // Requesting a rate is standard but not guaranteed: a browser may hand
-        // back the device's instead. The game renders at game_sample_rate
-        // regardless, so a mismatch would play its audio at the wrong speed -
-        // which is worth saying out loud rather than leaving to be noticed.
-        if (this.ctx.sampleRate !== SAMPLE_RATE) {
-            console.warn (`player: asked for ${SAMPLE_RATE} Hz, got `
-                + `${this.ctx.sampleRate} Hz; audio will play at the wrong `
-                + `rate on this machine.`);
-        }
-
+        this.ctx = null;
+        this.master = null;
         this.node = null;
+        this.closed = false;
 
-        this.master = this.ctx.createGain ();
-        this.master.gain.value = 0.5;
-        this.master.connect (this.ctx.destination);
+        // What `close` answered, once it has been asked.
+        this.gone = null;
+
+        // Whether the worklet has said its run is open, and whether the page
+        // has asked for the sound. The context is resumed when both are true.
+        this.opened = false;
+        this.wanted = false;
 
         this.ready = this.start ();
     }
 
     async start () {
+        // A promise that never rejects: `close` below catches its own.
+        if (this.previous) { await this.previous; }
+
+        // Put away while its predecessor closed: nothing is built.
+        if (this.closed) { return; }
+
         try {
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)
+                ({ sampleRate: SAMPLE_RATE });
+
+            // A browser may start a context it builds after the page has had a
+            // gesture, and this one must not run before its worklet has opened.
+            this.ctx.suspend ();
+
+            // Requesting a rate is standard but not guaranteed: a browser may
+            // hand back the device's instead. The game renders at
+            // game_sample_rate regardless, so a mismatch would play its audio
+            // at the wrong speed - which is worth saying out loud rather than
+            // leaving to be noticed.
+            if (this.ctx.sampleRate !== SAMPLE_RATE) {
+                synthWarn ("rate", `player: asked for ${SAMPLE_RATE} Hz, got `
+                    + `${this.ctx.sampleRate} Hz; audio will play at the `
+                    + `wrong rate on this machine.`);
+            }
+
+            this.master = this.ctx.createGain ();
+            this.master.gain.value = 0.5;
+            this.master.connect (this.ctx.destination);
+
             // data:, not a blob: a blob URL fails on file:// - measured.
             await this.ctx.audioWorklet.addModule (
                 "data:text/javascript," + encodeURIComponent (STATE_PLAYER));
+
+            // Put away again while the module loaded: a closed context is
+            // nothing to build a node in, and nothing will ever open one.
+            if (this.closed) { return; }
 
             this.node = new AudioWorkletNode (this.ctx, "states", {
                 numberOfInputs: 0,
                 outputChannelCount: [1],
             });
 
+            this.node.port.onmessage = (message) => this.heard (message.data);
+
             this.node.connect (this.master);
         } catch (error) {
-            console.warn ("player: audio unavailable:", error);
+            if (! this.closed) {
+                synthWarn ("worklet", "player: audio unavailable:", error);
+            }
         }
     }
 
-    resume () { if (this.ctx.state !== "running") this.ctx.resume (); }
+    // What the worklet says back, which is three things. Its run is open, so
+    // the context may run without stalling the audio thread. The audio thread
+    // stalled, which the console is told every time. And a resource it was
+    // handed lay past the end of the space its run reserved, which is a host
+    // bug and is said once a page.
+    heard (said) {
+        if (said.stall !== undefined) {
+            speakerStalled (said.stall, said.startup);
+
+            return;
+        }
+
+        if (said.refused !== undefined) {
+            synthWarn ("refused", `player: the speaker was handed ${said.size} `
+                + `bytes at ${said.address}`
+                + `${said.refused ? ` for resource ${said.refused}` : ""}, `
+                + `past the ${said.end} its run reserved, and sounds without `
+                + "them. That is a host bug.");
+
+            return;
+        }
+
+        if (! said.opened) { return; }
+
+        this.opened = true;
+
+        if (this.wanted) { this.resume (); }
+    }
+
+    // The page wants the sound. Resumed now if the worklet has opened its run,
+    // and otherwise by the `opened` above - outside the handler that asked,
+    // which a page that has had a gesture is allowed; on one that has not, the
+    // unlock listeners `start` installs ask again on the next press. A closed
+    // speaker never resumes.
+    resume () {
+        this.wanted = true;
+
+        if (this.closed || ! this.opened) { return; }
+
+        if (this.ctx.state !== "running") { this.ctx.resume (); }
+    }
+
+    // Put away for good: the context closes, and with it the worklet, its
+    // queue and whatever the device had not yet played. What it answers is
+    // when that is done, which is what the next `Synth` waits on - and for one
+    // that never built a context, when its predecessor's closed. Asked twice,
+    // it answers the same.
+    close () {
+        if (this.gone) { return this.gone; }
+
+        this.closed = true;
+
+        this.gone = this.ctx ? this.ctx.close ().catch (() => {})
+            : this.previous || Promise.resolve ();
+
+        return this.gone;
+    }
 
     // The run this processor renders, which is the only thing the page ever says
     // to it: the module's bytes, the addresses the simulation laid down, the
     // regions it laid down once, and the port the simulation will feed it on.
+    // Its `opened` is the answer.
     //
     // The PORT is transferred, and that is what takes this page off the sound's
     // path for the rest of the run - every tick after this message goes from the
@@ -1345,7 +1694,9 @@ let coreBytes = null;
 // audio context and the worklet behind it, a third instance rendering
 // `render_audio` on the descriptions the simulation posts IT. None of them
 // exists until a module has been fetched, and `reset` replaces all three,
-// because a run is a linear memory and a reset is a new one.
+// because a run is a linear memory and a reset is a new one. The speaker is
+// also replaced on its own, every time the sound is put away, which
+// `replaceSpeaker` argues.
 //
 // THIS PAGE HOLDS NEITHER CONSUMER, and that is the whole shape of the player.
 // It held one for the picture once - an instance handed the state block after
@@ -1361,6 +1712,11 @@ let coreBytes = null;
 let sim = null;
 let render = null;
 let synth = null;
+
+// Whether the page is going away: true from `pagehide` to the `pageshow` that
+// restores it, and while it is, a speaker put away is closed and none is built
+// in its place.
+let leaving = false;
 
 // What this run would keep if the page went away now, as the simulation last
 // rendered it - or null before a frame has stepped, and for a game that
@@ -1461,7 +1817,7 @@ let declaration = null;
 // the thing that decides the simulation has stopped answering.
 //
 // `runRecord` is `player.js`'s own record: the seed, the blob and the pairs the
-// run was constructed from, which arrive once with `opened`, and the four replay
+// run was constructed from, which arrive once with `opened`, and the five replay
 // logs, which the simulation adds to a frame at a time. Null until a run has
 // opened. `mark` composes a file out of it and so does `seize`, and neither asks
 // the other thread anything - which is the whole point, because the one run that
@@ -1493,7 +1849,7 @@ let renderWatch = new RenderWatch ();
 // told, and the only thread that knows it is the one this page must not
 // interrupt to ask. So the message is held for the life of the run, which costs
 // two small objects and a copy of the argument storage and the save blob - both
-// of them regions `interface/game.h:35-47` fixes for the whole run, so a copy
+// of them regions `interface/game.h:35-50` fixes for the whole run, so a copy
 // taken at frame 0 is still the bytes a renderer needs at frame ten thousand.
 //
 // Null until the run has opened, and null again on a reset.
@@ -1503,7 +1859,7 @@ let arena = null;
 // What the page is still waiting for the simulation to answer before it may act
 // on a halt. Exactly one thing can be: the real frame a pause costs, which
 // `stepPointerAway` asks for and which has to be PUBLISHED - to the speaker and
-// to the renderer both - before the audio context is suspended. Everything else
+// to the renderer both - before the sound is put away. Everything else
 // a halt does needs no answer.
 //
 // Published rather than painted, and the distinction is new: the page used to
@@ -1611,6 +1967,113 @@ addEventListener ("keyup", event => {
 
     event.preventDefault ();
 });
+
+// A MESSAGE TO THE GAME, posted to this window by a page of this site - a tuner
+// holding this player in a frame, a harness, a console - as
+// `{ kind: "arcade-message", name, value }`. `arcadeMessage` in `player.js` is
+// what it means: anything from another origin or of another shape is not
+// addressed here and is ignored without a word, and what is addressed here and
+// cannot be carried is answered, posted back to the sender as
+// `{ kind: "arcade-message-refused", name, value, reason }`, because a sender
+// that meant to say something to the game is owed the sentence saying why it
+// did not arrive.
+//
+// What is carried goes the way a key does: the page wakes itself and posts it
+// to the simulation stamped with the browser's own instant, and `Input` holds
+// it behind the step boundary that instant puts it at - so a message and a
+// press sent together land on the same frame. `undelivered` is what admits it,
+// counted up here and down off the frame messages that say a step was handed
+// one.
+
+let messageRules = null;
+let undelivered = 0;
+
+addEventListener ("message", event => {
+    const said = arcadeMessage (event, location.origin,
+        sim ? messageRules : null, undelivered, replayText !== null);
+
+    if (! said) { return; }
+
+    if (said.refused) {
+        const data = event.data;
+
+        console.warn (`player: message refused: ${said.refused}`);
+
+        if (event.source) {
+            event.source.postMessage ({ kind: "arcade-message-refused",
+                name: data.name, value: data.value, reason: said.refused },
+                event.origin);
+        }
+
+        return;
+    }
+
+    wake ();
+
+    undelivered++;
+
+    post ({ kind: "message", time: event.timeStamp,
+        name: said.message.name, value: said.message.value });
+});
+
+// THE RUN'S RECORDING, asked for by a page of this site as
+// `{ kind: "arcade-record-request" }` and answered to that page as
+// `{ kind: "arcade-record", text }` - the file `M` downloads, ending on the
+// newest frame this page has heard of, with the hash of that frame's
+// description on a `#` line under it - or with `text: null` and the reason
+// there is none. `arcadeRecord` in `player.js` is what it means, and it asks
+// the simulation nothing: the record is the page's, as it is for `M`.
+//
+// And A RECORDING TO START FROM, `{ kind: "arcade-resume", text }`, for a page
+// opened with `resume=message`: the first one is what the page has been
+// waiting on, and every later one resets the run onto it. Refused back to the
+// sender as `{ kind: "arcade-resume-refused", reason }`.
+
+addEventListener ("message", event => {
+    const asked = arcadeRecord (event, location.origin, runRecord && declaration
+        ? { name: declaration.name, version: declaration.version,
+            record: runRecord, hash: runHash, forwarding }
+        : null);
+
+    if (asked) {
+        if (event.source) { event.source.postMessage (asked, event.origin); }
+
+        return;
+    }
+
+    const handed = arcadeResume (event, location.origin, resuming);
+
+    if (! handed) { return; }
+
+    if (handed.refused) {
+        console.warn (`player: resume refused: ${handed.refused}`);
+
+        if (event.source) {
+            event.source.postMessage ({ kind: "arcade-resume-refused",
+                reason: handed.refused }, event.origin);
+        }
+
+        return;
+    }
+
+    resumeText = handed.text;
+
+    if (resumeArrived) {
+        const arrived = resumeArrived;
+
+        resumeArrived = null;
+
+        arrived ();
+    }
+    else if (wasmBytes) { reset (); }
+});
+
+// What a page opened with `resume=message` tells whoever framed it, which is
+// the parent and nobody else: the same origin is what `arcadeResume` holds
+// every answer to.
+function tellParent (message) {
+    if (parent !== window) { parent.postMessage (message, location.origin); }
+}
 
 // The pointer, and on the canvas rather than on the window: a click on the HUD
 // belongs to the page and a click on the screen belongs to the game. What each
@@ -1934,11 +2397,12 @@ function toggleChrome () { showChrome (hud.hidden); }
 let ratioWatch = null;
 let lastLayout = null;
 
+// A page in a frame reads the frame as its window, which `windowReading` in
+// `player.js` argues.
 function reading () {
-    return {
-        outerWidth, outerHeight, innerWidth, innerHeight,
-        ratio: devicePixelRatio,
-    };
+    return windowReading (
+        { outerWidth, outerHeight, innerWidth, innerHeight, devicePixelRatio },
+        window.self !== window.top);
 }
 
 function watchRatio () {
@@ -2225,10 +2689,10 @@ function commitPixels () {
 // main thread stalled by layout, a collection or an extension would otherwise
 // stall the speaker with it.
 //
-// It waits on `synth.ready`, which is `addModule` plus the node, and that wait
-// is why the channel is made in `reset` instead of here: a port holds what is
-// posted to it and carries its queue across the transfer, so the ticks of the
-// wait are heard rather than dropped.
+// It waits on `synth.ready`, which is its predecessor's close, `addModule` and
+// the node, and that wait is why the channel is made in `reset` instead of
+// here: a port holds what is posted to it and carries its queue across the
+// transfer, so the ticks of the wait are heard rather than dropped.
 //
 // A page whose worklet never arrived tells the simulation so, and that is not
 // tidiness: the far end would otherwise go on posting a state block a tick into
@@ -2429,22 +2893,32 @@ function replaceRenderer () {
 
 async function openAudio (layout, regions) {
     const worker = sim;
+    const speaker = synth;
     const port = audioPort;
 
     audioPort = null;
 
     if (! port) { return; }
 
-    if (synth) { await synth.ready; }
+    if (speaker) { await speaker.ready; }
 
     // A run replaced while this waited: the thread on the far end has been
     // terminated, so there is nobody left to tell and nothing to close but this
     // end of a channel that can no longer carry anything.
     if (worker !== sim) { port.close (); return; }
 
-    // No worklet, for any of the reasons `Synth.start` catches - and the
-    // simulation is TOLD, rather than left posting into it.
-    if (! synth || ! synth.node) {
+    // And a SPEAKER replaced while this waited, which is the sound put away
+    // twice in quick succession: the replacement brokered a channel of its
+    // own and an `openAudio` of its own behind it, and the simulation closed
+    // the far end of this one on that `audience`. So this opens nothing - the
+    // newer call opens the newer speaker - and its end goes the way the far
+    // one went.
+    if (speaker !== synth) { port.close (); return; }
+
+    // No worklet, for any of the reasons `Synth.start` catches, or a speaker a
+    // page going away closed and did not replace - and the simulation is TOLD,
+    // rather than left posting into it.
+    if (! speaker || ! speaker.node || speaker.closed) {
         port.close ();
 
         worker.postMessage ({ kind: "audience", port: null });
@@ -2452,7 +2926,59 @@ async function openAudio (layout, regions) {
         return;
     }
 
-    synth.open (wasmBytes, trampolineBytes, coreBytes, layout, regions, port);
+    speaker.open (wasmBytes, trampolineBytes, coreBytes, layout, regions, port);
+}
+
+// The sound put away, which REPLACES the speaker rather than suspending it: the
+// context is closed and a new `Synth` is built in its place, suspended and
+// never started, so the next wake starts a context that has never run.
+//
+// NOT A SUSPEND, which is what all five callers used to do. Safari keeps a STALL
+// on the audio thread as delay - a 200 ms hold inside `process` left the sound
+// 200 ms later, and it stayed - where a suspend and a resume add none; and only
+// a new context starts at zero. So a put-away is where whatever a stall left is
+// cleared. No script can read that delay, so nothing here could replace only
+// once it had grown. What a replacement costs - an `addModule`, three modules
+// compiled in the worklet and the resources sent again - is paid while nothing
+// plays, because the new context runs only once its worklet has opened, and
+// what the old context had queued goes with it rather than playing stale on the
+// wake.
+//
+// THE NEW CONTEXT IS BUILT ONLY ONCE THE OLD ONE HAS CLOSED. The `Synth` is
+// built at once, so `synth` is never null and every caller goes on working,
+// and it is handed the old one's `close` to wait on: a context still open when
+// the next is built can keep the old one's delay alive. And a page going away
+// builds none - `leaving` above, and `pagehide` below.
+//
+// A RUN THAT IS LIVE IS BROKERED A CHANNEL, exactly as `reset` brokers the
+// first and `replaceRenderer` above brokers a renderer's: the simulation is
+// told `audience` with one end, which it takes as a new consumer holding
+// nothing and hands the live table's audio resources at once, and `openAudio`
+// gives the new worklet the other. With no run - `seize` has just ended it -
+// the speaker is only built, and the next `reset` builds its own; and before
+// the run has said where its arena is, which is where `reset` calls this, it is
+// only built too, because `fromSim`'s `opened` case opens whichever speaker is
+// current by then on the channel `reset` made.
+
+function replaceSpeaker () {
+    cancelAudioRest ();
+
+    const closing = synth ? synth.close () : null;
+
+    if (leaving) { return; }
+
+    synth = new Synth (closing);
+
+    if (! sim || ! arena) { return; }
+
+    const channel = new MessageChannel ();
+
+    audioPort = channel.port1;
+
+    sim.postMessage ({ kind: "audience", port: channel.port2 },
+        [channel.port2]);
+
+    openAudio (arena.layout, arena.resident);
 }
 
 // Mark: the playtest hook from the design. Packages the frame index, the
@@ -2465,7 +2991,7 @@ async function openAudio (layout, regions) {
 //
 // TWO HALVES STILL, and the seam is the browser rather than the thread. What a
 // recording is made of - the seed the run really used, the pairs it was told,
-// the blob it was constructed from and the four logs - reaches this page as the
+// the blob it was constructed from and the five logs - reaches this page as the
 // run goes along and is held in `runRecord` below; `markText` in `player.js`
 // composes the file out of it, because that is arithmetic over a format and
 // needs no browser; and what is left here is the two calls that put text in a
@@ -2535,10 +3061,12 @@ function writeMark (record) {
 //
 // The sound goes with it. `render_audio` runs in the worklet on states this
 // thread no longer receives, so a processor left running would play its queue
-// out and then 800 zeros a tick for ever; suspending is what a halt already does
-// for a game that stopped for a better reason.
+// out and then 800 zeros a tick for ever; putting it away is what a halt
+// already does for a game that stopped for a better reason. With the
+// simulation gone the replacement is only built, and the `reset` after this
+// builds one of its own.
 //
-// AND THE PICTURE, for the same reason and with nothing to suspend: the renderer
+// AND THE PICTURE, for the same reason and with nothing to close: the renderer
 // is a thread holding an instance of a game that no longer runs, so it is ended
 // rather than left. The last frame the page COMMITTED stays on screen, which is
 // what a person reading the banner over it should see, and it stays there for
@@ -2565,7 +3093,7 @@ function seize (reason, frames) {
 
     if (screenPort) { screenPort.close (); screenPort = null; }
 
-    if (synth && synth.ctx) { synth.ctx.suspend (); }
+    if (synth) { replaceSpeaker (); }
 
     showAlarm (reason);
 
@@ -2653,6 +3181,10 @@ function reset () {
         sim = null;
     }
 
+    // A message the outgoing run was never handed goes with it: the run it was
+    // said to no longer exists, and the next one starts told nothing.
+    undelivered = 0;
+
     if (render) {
         render.postMessage ({ kind: "close" });
         render.terminate ();
@@ -2677,6 +3209,8 @@ function reset () {
     // purpose, and a replacement already spent would be spent against the wrong
     // run.
     runRecord = null;
+    runHash = null;
+    forwarding = resuming;
     watchdog = new Watchdog ();
     renderWatch = new RenderWatch ();
     arena = null;
@@ -2823,6 +3357,10 @@ function reset () {
         // compose this field from nothing but the probe's own query.
         replay: replayText,
 
+        // Or the recording this run starts from and plays on past, on a page
+        // opened with `resume=message` and on no other.
+        resume: resuming ? resumeText : null,
+
         // Whether the simulation keeps the scrub bar's ring, which is
         // allocated and filled only where the address said `scrub=on`.
         scrub: scrubbing,
@@ -2854,6 +3392,16 @@ function reset () {
     // Before the first tick rather than after the worklet is ready, because a
     // port holds what is posted to it and carries its queue across the
     // transfer: the frames a run sounds while `addModule` resolves are heard.
+    //
+    // AND A SPEAKER OF ITS OWN at the far end, the first at load among them.
+    // The old one is closed as a put-away closes it rather than handed the new
+    // run, because handing it one opens a run on an audio thread that is
+    // playing. The new one is asked for the sound unless the run is silenced,
+    // and `Synth` holds that until its worklet has opened.
+    replaceSpeaker ();
+
+    if (! silenced (halt)) { synth.resume (); }
+
     const channel = new MessageChannel ();
 
     audioPort = channel.port1;
@@ -2917,14 +3465,14 @@ function fromSim (message) {
         // those bytes rather than the ones the store already held. Kept exactly
         // as a frame's is, through the same slot, so nothing below this can tell
         // which message a blob arrived on.
-        if (message.save) { keptSave = message.save; }
+        if (message.save && ! resuming) { keptSave = message.save; }
 
         // The addresses the simulation laid down and the regions it laid down
         // once, to BOTH consumers: each is an instance of the same module
         // rendering the same bytes, one thread over, and each needs both
         // because a renderer may follow a pointer into the argument storage,
         // the save blob or a task's output, which is
-        // `interface/game.h:35-47`'s list.
+        // `interface/game.h:35-50`'s list.
         //
         // The renderer first, because it is the one with a person waiting on
         // it: the sound waits on `addModule` either way, and a frame drawn
@@ -2972,6 +3520,16 @@ function fromSim (message) {
         // nothing on almost every frame.
         growRecord (runRecord, message.frame, message.records);
 
+        // And what the newest description folds to, for a recording asked for
+        // after this frame to end on.
+        runHash = message.hash || null;
+
+        // And what the queue a sender is admitted against shrank by: every
+        // message a step was handed is logged, so the log's growth is the
+        // count of deliveries.
+        undelivered = Math.max (0,
+            undelivered - message.records.message.length);
+
         // And the probe's other two halves, off the same message.
         //
         // The pointer records say which FRAME the simulation applied a position
@@ -2995,15 +3553,15 @@ function fromSim (message) {
         // a host saves and this is not one of its moments; and a frame carrying
         // none leaves the last one standing, which is what makes this a mailbox
         // rather than a log.
-        if (message.save) { keptSave = message.save; }
+        if (message.save && ! resuming) { keptSave = message.save; }
 
         // The frame a pause costs has been published, so the sound may now stop.
-        // `setHalt` held it back for exactly this: the audio context is
-        // suspended after the last frame it is owed rather than before it.
+        // `setHalt` held it back for exactly this: the sound is put away after
+        // the last frame it is owed rather than before it.
         //
         // OWED rather than heard, and that was already the case before the
         // worklet rendered: the queue on the far side is up to three ticks deep,
-        // so what a suspend cuts off is whatever of them had not reached the
+        // so what a put-away cuts off is whatever of them had not reached the
         // speaker. What changed is only which side the arithmetic happens on.
         if (message.pointerAway && quietWhenPublished) {
             quietWhenPublished = false;
@@ -3017,13 +3575,10 @@ function fromSim (message) {
             // `silenced` and not `halted`, which is the narrower of the two and
             // is what makes this path KEEP the grace rather than cut it short.
             // A game that went to rest inside that round trip is a game nobody
-            // stopped listening to; `halted` here would suspend it on the
-            // instant, which is the one thing the five seconds above exist to
-            // prevent, and this is the one path left that could do it.
-            if (synth && silenced (halt)) {
-                cancelAudioRest ();
-                synth.ctx.suspend ();
-            }
+            // stopped listening to; `halted` here would put its sound away on
+            // the instant, which is the one thing the five seconds above exist
+            // to prevent, and this is the one path left that could do it.
+            if (synth && silenced (halt)) { replaceSpeaker (); }
         }
 
         // The game says nothing more is coming until something happens to it,
@@ -3034,6 +3589,30 @@ function fromSim (message) {
 
         break;
     }
+
+    // A resumed run handed over to the hand, said to whoever framed this page
+    // only where the run did not arrive at the picture its recording named.
+    case "resumed":
+        forwarding = false;
+
+        if (message.diverged) {
+            console.warn (`player: the run resumed at frame ${message.frame} `
+                + `is not the run its recording was taken from`);
+
+            tellParent ({ kind: "arcade-resume-diverged",
+                frame: message.frame });
+        }
+
+        break;
+
+    // A recording to start from that says less than a run needs, refused
+    // before anything was built. The page goes on waiting for another.
+    case "unresumed":
+        console.warn (`player: resume refused: ${message.reason}`);
+
+        tellParent ({ kind: "arcade-resume-refused", reason: message.reason });
+
+        break;
 
     // A task became ready under a game whose state had no other reason to move.
     case "wake":
@@ -3169,10 +3748,11 @@ const halt = { paused: false, hidden: false, idle: false };
 // How long a game goes on resting before its sound is put away.
 //
 // Not the instant it rests, and the case that says so is the ordinary one: a
-// game that thinks between moves is idle between every move, so suspending on
-// the first resting frame and resuming on the next press would cycle the audio
-// hardware once per move for the whole run. A suspend and a resume are not free
-// either - `resume` is asynchronous, the platform may have powered the output
+// game that thinks between moves is idle between every move, so putting the
+// sound away on the first resting frame and resuming on the next press would
+// build an audio context once per move for the whole run. A put-away and a
+// resume are not free either - a put-away is a context closed and another
+// built, `resume` is asynchronous, the platform may have powered the output
 // down in between, and `docs/decisions.md` records a blocked `resume` here
 // neither resolving nor rejecting, which is the same class of bug as the
 // fullscreen request that spent the page's user activation and silenced the
@@ -3200,9 +3780,9 @@ const halt = { paused: false, hidden: false, idle: false };
 
 const AUDIO_GRACE = 5000;
 
-// The pending suspend, or null. One at a time, and `setHalt` is the only writer
-// of it, so a game that wakes and rests again inside the window cancels its own
-// timer rather than accumulating one per rest.
+// The pending put-away, or null. One at a time, and `setHalt` is the only
+// writer of it, so a game that wakes and rests again inside the window cancels
+// its own timer rather than accumulating one per rest.
 
 let audioRest = null;
 
@@ -3242,8 +3822,8 @@ function cancelAudioRest () {
 // has always meant.
 //
 // The ORDER is what the page has to keep, and it is the reason this is not
-// fire-and-forget. Suspending the audio context before that frame's samples had
-// been handed over would drop them, so `setHalt` sets `quietWhenPublished` and
+// fire-and-forget. Putting the sound away before that frame's samples had been
+// handed over would drop them, so `setHalt` sets `quietWhenPublished` and
 // `fromSim` is what finally stops the sound. Nothing else a halt does waits on
 // anything.
 
@@ -3344,11 +3924,9 @@ function setHalt (change) {
     applyCursor ();
 
     // Emitting nothing means sustain, so a game that stops stepping mid-note
-    // would drone on. Suspending stops the worklet outright.
-    if (sound === "stop" && ! quietWhenPublished) {
-        cancelAudioRest ();
-        synth.ctx.suspend ();
-    }
+    // would drone on. Putting the sound away stops the worklet outright: its
+    // context is closed and a fresh one waits for the wake.
+    if (sound === "stop" && ! quietWhenPublished) { replaceSpeaker (); }
 
     // A game resting is the one halt the sound leaves slowly - `AUDIO_GRACE`
     // above holds why, and what the number is a judgement between.
@@ -3366,7 +3944,7 @@ function setHalt (change) {
         audioRest = setTimeout (() => {
             audioRest = null;
 
-            if (halted (halt)) { synth.ctx.suspend (); }
+            if (halted (halt)) { replaceSpeaker (); }
         }, AUDIO_GRACE);
     }
 
@@ -3377,12 +3955,14 @@ function setHalt (change) {
     // retry it on the player's next gesture - the same mechanism, for the same
     // reason, as the fullscreen key that used to spend the activation.
     //
-    // A game waking inside the grace reaches this with nothing suspended and
-    // only a timer to take back; one waking after it reaches a context that was
-    // put away. The two lines are the same either way, because `resume` on a
-    // running context is a no-op and the one browser this arcade is played in
-    // that grants a new document no user activation is the one where every
-    // press is a chance to unlock what the load could not.
+    // A game waking inside the grace reaches this with nothing put away and
+    // only a timer to take back; one waking after it reaches the fresh context
+    // the put-away built. The two lines are the same either way, because
+    // `resume` on a running context is a no-op and the one browser this arcade
+    // is played in that grants a new document no user activation is the one
+    // where every press is a chance to unlock what the load could not. A wake
+    // that comes before the fresh speaker's worklet has opened is held by
+    // `Synth.resume` until it has, and so leaves this handler.
     if (sound === "start") { cancelAudioRest (); synth.resume (); }
 
     if (run === "stop") {
@@ -3495,7 +4075,18 @@ function togglePause () { setHalt ({ paused: ! halt.paused }); }
 // live again but nothing need have changed visibility to get there, so it reads
 // the state rather than assuming one.
 
-addEventListener ("pagehide", () => setHalt ({ hidden: true }));
+// AND THE SPEAKER IS CLOSED AND NOT REPLACED, whether or not the page is kept:
+// a context built in a document that is going away can keep its output alive
+// into the next one. `leaving` holds every put-away off building one, and
+// `setHalt` moves its flags exactly as it would for a hidden tab.
+
+addEventListener ("pagehide", () => {
+    leaving = true;
+
+    setHalt ({ hidden: true });
+
+    if (synth) { cancelAudioRest (); synth.close (); }
+});
 
 // AND THE CHAIN, TAKEN BACK AND ARMED AGAIN on the restore alone.
 //
@@ -3510,9 +4101,20 @@ addEventListener ("pagehide", () => setHalt ({ hidden: true }));
 // already gone is a no-op, so what this costs is two calls on a navigation and
 // what it removes is a run that never moves again with nothing on the page to
 // say why.
+//
+// And a fresh speaker for the one `pagehide` closed, on the restore alone: it
+// opens if a run is live, and it is asked for the sound unless the run is
+// silenced, since the halt below may already have moved on a
+// `visibilitychange` that reached the closed one.
 
-addEventListener ("pageshow", () => {
+addEventListener ("pageshow", (event) => {
+    leaving = false;
+
+    if (event.persisted && synth) { replaceSpeaker (); }
+
     setHalt ({ hidden: document.hidden });
+
+    if (event.persisted && synth && ! silenced (halt)) { synth.resume (); }
 
     stopLoop ();
     runLoop ();
@@ -3777,10 +4379,11 @@ function loop (now) {
 // without a user gesture starts suspended and stays there - measured, on
 // file:// and http:// alike - so the first gesture of any kind resumes it. That
 // is usually the same keypress that leaves the title screen, so a player never
-// notices there was a rule. Arriving from a menu by clicking a link, the
-// context is already running, because activation propagates across a navigation
-// a gesture initiated - also measured - and then nothing here has to happen at
-// all.
+// notices there was a rule. Arriving from a menu by clicking a link, a context
+// built at load used to be running already, because activation propagates
+// across a navigation a gesture initiated - also measured. Every context is
+// built suspended now, and `reset`'s resume is what starts that one, once its
+// worklet has opened and with no press.
 //
 // The keypress is NOT consumed: it belongs to the game, which is watching for
 // exactly that edge.
@@ -3804,8 +4407,13 @@ function start ([bytes, host, rules]) {
     // composed at load rather than one re-read now - a page that re-read the
     // clock here would play one day and record another the moment a run crossed
     // midnight.
+    //
+    // The same rulebook is what a message posted to this window is held to, so
+    // it is kept rather than spent.
+    messageRules = new HostCore (core);
+
     ({ seed: runSeed, args: runArguments } = queryArguments (runQuery,
-        new HostCore (core)));
+        messageRules));
 
     reset ();
 
@@ -3823,19 +4431,17 @@ function start ([bytes, host, rules]) {
     console.info (`player: ${declaration.name} reads what its bodies ask `
         + `for from ` + resourceDirectory.href);
 
-    // Built at load, not on the gesture. Compiling the module, loading the
-    // worklet and constructing the processor all work on a suspended context -
-    // measured, the processor runs and answers on the audio thread with no
-    // gesture whatsoever - and only `resume()` is gated. Building it here costs
-    // nothing and removes an eight frame window, measured, in which the loop
-    // was already running and anything the game emitted was dropped for want of
-    // a node.
-    synth = new Synth ();
-
+    // The speaker is the one `reset` above built, at load rather than on the
+    // gesture. Compiling the module, loading the worklet and constructing the
+    // processor all work on a suspended context - measured, the processor runs
+    // and answers on the audio thread with no gesture whatsoever - and only
+    // `resume()` is gated. Building it then costs nothing and removes an eight
+    // frame window, measured, in which the loop was already running and
+    // anything the game emitted was dropped for want of a node.
+    //
     // Except while the scrub bar is open, where the sound is the bar's to start
     // and stop: an arrow tapped there must stay silent, and a context this
-    // resumed on it would play out whatever the pause cut off and then run on
-    // until the resume.
+    // resumed on it would run on until the resume.
     const unlock = () => {
         if (! (scrubbing && halt.paused)) { synth.resume (); }
     };
@@ -3946,6 +4552,16 @@ Promise.all ([
         ? fetch (new URL (replayUrl, location.href))
             .then ((answer) => answer.text ())
             .then ((text) => { replayText = text; })
+        : null,
+
+    // And the recording a resumed run starts from, which nobody fetches: the
+    // page says it is ready and the parent hands it over.
+    resuming
+        ? new Promise ((resolve) => {
+            resumeArrived = resolve;
+
+            tellParent ({ kind: "arcade-resume-ready" });
+        })
         : null,
 ]).then (start);
 </script>

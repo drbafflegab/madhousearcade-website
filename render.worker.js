@@ -468,7 +468,7 @@ self.onmessage = (event) => {
 
         // The regions the simulation laid down once and never writes again: the
         // argument storage and the save blob `construct` was handed. Both are
-        // the host's for the whole run by `interface/game.h:35-47`, so a game
+        // the host's for the whole run by `interface/game.h:35-50`, so a game
         // may hold a pointer into either and a renderer needs both before the
         // first description can be rendered.
         for (const region of message.resident || []) {

@@ -105,17 +105,20 @@ let session = null;
 let input = null;
 let clock = null;
 
-// What each consumer has been handed, by resource id - `publishResources`'s own
-// bookkeeping, held here because what a consumer holds is its own.
+// What each consumer has been handed, by resource id, and the address each was
+// handed at - `publishResources`'s own bookkeeping, held here because what a
+// consumer holds is its own. The address is half of it because the speaker's
+// space moves a resource when it compacts, and a resource held at the address
+// it has left is a resource to hand over again.
 //
-// ONE SET PER CONSUMER, and there are two: the speaker and the renderer hold
+// ONE MAP PER CONSUMER, and there are two: the speaker and the renderer hold
 // separate copies of a resource at the same address in separate memories, and
 // each is handed only the resources its own call may lock - the speaker the
 // ones scoped for `render_audio`, the renderer the ones scoped for
-// `render_video` - so neither set may answer for the other.
+// `render_video` - so neither map may answer for the other.
 
-let heldByAudio = new Set ();
-let heldByScreen = new Set ();
+let heldByAudio = new Map ();
+let heldByScreen = new Map ();
 
 // How much of each replay log the page has already been told about. The same
 // bookkeeping as the two maps above and for the same reason: the page keeps a
@@ -130,9 +133,9 @@ let heldByScreen = new Set ();
 // makes one file over: hold what a closing or a wedged page will need, so there
 // is no round trip left to take. `player.js`'s `markText` is what composes it.
 
-let reported = { input: 0, tap: 0, task: 0, pointer: 0 };
+let reported = { input: 0, tap: 0, task: 0, pointer: 0, message: 0 };
 
-// Everything the four logs have grown by since the last frame message. Called
+// Everything the five logs have grown by since the last frame message. Called
 // wherever one is posted, including where nothing stepped - the arrays are empty
 // then, and a frame message with no records on it is what a page reading them
 // unconditionally needs.
@@ -151,12 +154,14 @@ const freshRecords = () => {
         tap: take (session.tapLog, 'tap'),
         task: take (session.taskLog, 'task'),
         pointer: take (session.pointerLog, 'pointer'),
+        message: take (session.messageLog, 'message'),
     };
 };
 
 // The worklet's end of the channel the page made, or null on a page whose
 // worklet never arrived - which the page says in as many words, because a port
-// nothing drains is a state block a tick that is never freed.
+// nothing drains is a state block a tick that is never freed. A new one every
+// time the page puts the sound away, because that builds a new worklet.
 
 let audioPort = null;
 
@@ -287,6 +292,26 @@ const sound = () => {
     audio = [];
 };
 
+// What a NEW speaker is owed before anything else: the bytes of every resource
+// scoped for `render_audio` the live table names, at their own addresses and
+// under their own ids, sent the moment `audience` below hands this thread its
+// port. `heldByAudio` is empty then, so `publishResources` answers the lot and
+// records it as held.
+//
+// A DELIVERY AND NOT A TICK. It carries no description and takes no slot in the
+// worklet's queue, because a tick is TIME and this is not: posted as one, it
+// would be 800 samples nobody rendered, and every sound after it would be that
+// much late. Nothing at all where there is nothing to hand over.
+const handOver = () => {
+    const { fresh } = publishResources (session.publisher (), heldByAudio,
+        CORE.scope.audio);
+
+    if (! fresh.length) { return; }
+
+    audioPort.postMessage ({ delivery: true, fresh },
+        fresh.map (resource => resource.bytes.buffer));
+};
+
 // What the tick owes the RENDERER, down the page's second channel: the one
 // description the picture is a function of, and the store as the step that
 // captured it left it - the rows of the table, and the bytes of every resource
@@ -393,11 +418,15 @@ const openRing = (session) => ({
     slots: Array.from ({ length: SCRUB_FRAMES },
         () => ({ frame: -1, rows: [], sounds: false })),
     head: 0,
+
+    // The first frame the ring was given: 0, or the frame a resumed run was
+    // handed over on, since the prefix before it was stepped and never kept.
+    first: 0,
 });
 
 // The oldest frame still held. Derived from the head, never stored, so the two
 // cannot disagree.
-const floorOf = () => Math.max (0, ring.head - SCRUB_FRAMES + 1);
+const floorOf = () => Math.max (ring.first, ring.head - SCRUB_FRAMES + 1);
 
 // What the step that just ran captured, copied into its slot. Called with that
 // step's report from both places a step is taken - the clock's per-step
@@ -500,7 +529,7 @@ const soundSlot = (frame, reverse) => {
 // this thread used to do to it and why it must not any more.
 //
 // THE FRAME MESSAGE IS A HEARTBEAT AND CARRIES NO PICTURE. What is left on it is
-// what only the page can act on: the frame count and the four logs' new entries,
+// what only the page can act on: the frame count and the five logs' new entries,
 // which are the record a wedged page writes its recording out of; `stepped` and
 // `held`, which say what the tick did; `idle`, which is the game asking to stop;
 // and the save blob on the frames the game asked for one, which is the one thing
@@ -574,6 +603,10 @@ const frame = (now) => {
         // never been empty-handed.
         save: tick.asked ? session.renderSave () : null,
 
+        // What the newest description folds to, which the page keeps so that
+        // a recording it answers a request with names the picture it ends on.
+        hash: described (),
+
         records: freshRecords (),
     });
 };
@@ -619,15 +652,21 @@ const frame = (now) => {
 let replay = null;
 
 // `arg` keeps its value's interior spaces and cannot begin with one, which is
-// the grammar `Game_Arg` states and the one line here that a split on
+// the grammar `Game_Pair` states and the one line here that a split on
 // whitespace would quietly rewrite. Read off the format the way `goldenhash.js`
 // reads it rather than checked against it.
 
 const ARG_LINE = /^arg\s+(\S+)(?:\s+([\s\S]*))?$/;
 
+// And `message`, which is `arg` with a frame in front: the value runs to the
+// end of the line, so it keeps its interior spaces, and a bare name is the
+// empty value.
+const MESSAGE_LINE = /^message\s+([0-9]+)\s+(\S+)(?:\s+([\s\S]*))?$/;
+
 const parseReplay = (text) => {
     const file = { seed: null, args: [], save: null, frames: null,
-        inputs: [], taps: [], moves: [], done: false };
+        inputs: [], taps: [], moves: [], messages: [], tasks: [],
+        done: false };
 
     for (const raw of text.split (/\r?\n/)) {
         const line = raw.trim ();
@@ -661,6 +700,22 @@ const parseReplay = (text) => {
             if (written) {
                 file.args.push ({ name: written [1],
                     value: written [2] === undefined ? '' : written [2] });
+            }
+        }
+        // The frame each answer became visible on. Read for a RESUMED run
+        // alone, which holds every answer to its line; a probe's driver
+        // ignores them and its loads land whenever the browser finishes them.
+        else if (key === 'task' || key === 'taskfail') {
+            file.tasks.push ({ frame: Number (rest [0]), id: Number (rest [1]),
+                failed: key === 'taskfail' });
+        }
+        else if (key === 'message') {
+            const written = line.match (MESSAGE_LINE);
+
+            if (written) {
+                file.messages.push ({ frame: Number (written [1]),
+                    name: written [2],
+                    value: written [3] === undefined ? '' : written [3] });
             }
         }
     }
@@ -699,7 +754,7 @@ const hexBytes = (hex) => {
 const scriptInput = (target, file, frameOf) => {
     let held = new Set (), previous = new Set ();
     let pointer = { x: 0, y: 0, present: false, hovers: true };
-    let heldAt = 0, tapAt = 0, moveAt = 0;
+    let heldAt = 0, tapAt = 0, moveAt = 0, messageAt = 0;
 
     target.applyUpTo = () => {
         const frame = frameOf ();
@@ -720,6 +775,17 @@ const scriptInput = (target, file, frameOf) => {
             && file.moves [moveAt].frame === frame)
         {
             pointer = file.moves [moveAt++];
+        }
+
+        // The frame's messages, whole: a recording names the frame each was
+        // delivered on and was held at load to what one frame carries, so
+        // nothing here is carried and `takeMessages` takes all of them.
+        target.messages = [];
+
+        while (messageAt < file.messages.length
+            && file.messages [messageAt].frame === frame)
+        {
+            target.messages.push (file.messages [messageAt++]);
         }
 
         // An edge is a button newly held or one tapped inside the frame, which
@@ -757,7 +823,210 @@ const scriptInput = (target, file, frameOf) => {
     target.queue = () => false;
     target.queuePointer = () => false;
     target.queuePointerButton = () => false;
+    target.queueMessage = () => false;
     target.waiting = () => false;
+};
+
+// ---------------------------------------------------------------------------
+// A RUN STARTED FROM A RECORDING AND THEN PLAYED ON, which is what
+// `resume=message` asks for and what a tuner's snapshot is restored through.
+// `docs/archived/tuner-snapshots-plan.md` is the design.
+//
+// It is the probe's driver above with three differences, and each is the
+// difference between a recording played to its end and one played up to a
+// moment and then handed back.
+//
+// THE PREFIX IS STEPPED AS FAST AS THIS THREAD CAN, undrawn and unheard: no
+// clock, no tick, no picture to the renderer, no sound to the worklet and no
+// slot in the scrub ring - the first frame anything shows is the frame the
+// recording ends on. The page's ticks are not answered while it runs, so the
+// watchdog, which is armed by the first answer, is not yet watching: a `step`
+// that never returns inside a prefix is outside it, as a `construct` that
+// never returns is.
+//
+// EVERY ANSWER LANDS ON THE FRAME ITS `task` LINE NAMES. A body here finishes
+// whenever its thread does, and an answer shown a frame early or late builds a
+// different run and says nothing about it. So `Session.holdAnswer` takes each
+// landing, the boundary of the frame a line names waits until every answer the
+// line names has arrived and lands them there, with the line's own `taskfail`,
+// and an answer no line names is held to the hand-over and landed then. A line
+// naming an id this run has not spawned cannot be honoured at all, and is the
+// divergence below.
+//
+// AND THE CONTROLS PASS TO THE HAND on the frame after the recording's `frame`:
+// from there the queue the page has been filling all along drives the clock
+// exactly as on any run. The recording's held buttons and its pointer are not
+// carried over - a hand holds what a hand holds - so a resumed run's recording
+// is the prefix, line for line, and then whatever the hand did.
+//
+// THE ARRIVAL IS CHECKED, NOT TRUSTED. A recording the page answered with
+// carries the hash of the description its last frame captured, on the `#` line
+// `snapshotText` in `player.js` writes, and a run arriving at another one - or
+// one whose recording named a task it never spawned - says so in `resumed`.
+// Nothing in this tree should ever trip it; it is what makes a hold that failed
+// loud rather than a restore that drifted.
+// ---------------------------------------------------------------------------
+
+// True from the moment a resumed run is built to the frame it is handed over
+// on, and false on every other run.
+let forwarding = false;
+
+// The hand-over's picture, owed to a renderer that has not been named yet. A
+// prefix whose answers are already in hand runs to its end inside the turn the
+// `open` arrived on, before the page's `viewer` message behind it has been
+// read, so the first picture is shown when the port arrives rather than lost.
+let owedPicture = false;
+
+// What the newest description folds to, posted on every frame message for the
+// page to keep beside its record: it is the snapshot hash a recording the page
+// answers with ends on.
+const described = () => describedHash (new Uint8Array (session.memory.buffer,
+    session.videoStatePtr, session.videoStateSize));
+
+// What a recording must say for a run to be started from it, or the sentence
+// refusing it - checked before anything is built, beside the message check the
+// probe's driver already makes. A recording that does not say how far it runs,
+// or that names a frame at or past that, is not a moment a run can be handed
+// back at.
+const resumeRefusal = (file, rules) => {
+    if (file.frames === null || ! Number.isInteger (file.frames)
+        || file.frames < 0)
+    {
+        return `a recording to start from says how far it runs on a \`frame\` `
+            + `line, and this one does not`;
+    }
+
+    if (file.seed !== null && ! Number.isInteger (file.seed)) {
+        return `the recording's \`seed\` line is not a number`;
+    }
+
+    for (const [kind, lines] of [['input', file.inputs], ['tap', file.taps],
+        ['pointer', file.moves], ['message', file.messages],
+        ['task', file.tasks]])
+    {
+        for (const line of lines) {
+            if (! Number.isInteger (line.frame) || line.frame < 0
+                || line.frame >= file.frames)
+            {
+                return `a \`${kind}\` line names frame ${line.frame}, and the `
+                    + `recording runs ${file.frames} frames`;
+            }
+        }
+    }
+
+    for (const task of file.tasks) {
+        if (! Number.isInteger (task.id) || task.id < 1) {
+            return `a \`task\` line on frame ${task.frame} names no task id`;
+        }
+    }
+
+    for (const move of file.moves) {
+        if (move.present
+            && (! Number.isInteger (move.x) || ! Number.isInteger (move.y)))
+        {
+            return `a \`pointer\` line on frame ${move.frame} is neither a `
+                + `position nor \`away\``;
+        }
+    }
+
+    if (! rules.settleArguments (file.args).taken) {
+        return `the recording's \`arg\` lines are not pairs this console `
+            + `carries`;
+    }
+
+    return recordedMessageRefusal (file.messages, rules);
+};
+
+// The prefix, stepped, and the hand-over. `text` is the recording as it was
+// handed in, for the hash note `parseReplay` skips with every other `#` line.
+const forward = async (file, text) => {
+    const run = session;
+    const began = performance.now ();
+
+    // The recording's own driver, on a queue of its own: the page's `input`
+    // goes on filling with whatever the hand does meanwhile, and is what the
+    // clock reads from the hand-over on.
+    const script = new Input ();
+
+    scriptInput (script, file, () => run.frameIndex);
+
+    const due = new Map ();
+
+    for (const task of file.tasks) {
+        if (! due.has (task.frame)) { due.set (task.frame, []); }
+
+        due.get (task.frame).push (task);
+    }
+
+    const held = new Map ();
+    let heard = null;
+
+    run.holdAnswer = (id, land) => {
+        held.set (id, land);
+
+        if (heard) { const wake = heard; heard = null; wake (); }
+    };
+
+    const inAir = (id) => {
+        const work = run.work.get (id);
+
+        return work !== undefined && work.running;
+    };
+
+    let strayed = false, report = 0;
+
+    while (run.frameIndex < file.frames) {
+        for (const { id, failed } of due.get (run.frameIndex) || []) {
+            while (! held.has (id) && inAir (id)) {
+                await new Promise ((resolve) => { heard = resolve; });
+
+                // A `close` while waiting is a run nobody wants any more.
+                if (session !== run) { return; }
+            }
+
+            const land = held.get (id);
+
+            if (! land) { strayed = true; continue; }
+
+            held.delete (id);
+
+            land (failed);
+        }
+
+        script.applyUpTo ();
+
+        report = run.advance (script.buttons, script.edges, script.pointer,
+            script.takeMessages (run.messageRoom));
+
+        script.clearEdges ();
+    }
+
+    // Every answer still held, landed in id order now that nothing says when.
+    run.holdAnswer = null;
+
+    for (const id of [...held.keys ()].sort ((x, y) => x - y)) {
+        held.get (id) (false);
+    }
+
+    const expected = snapshotHashOf (text);
+    const arrived = described ();
+
+    if (ring) { ring.first = run.frameIndex; remember (report); }
+
+    forwarding = false;
+
+    self.postMessage ({ kind: 'resumed', frame: run.frameIndex,
+        checked: expected !== null,
+        diverged: strayed || (expected !== null && expected !== arrived),
+        elapsed: performance.now () - began });
+
+    // The first picture, which is the recording's last frame, and the
+    // heartbeat that hands the page the prefix's records.
+    if (screenPort) { show (); } else { owedPicture = true; }
+
+    self.postMessage ({ kind: 'frame', frame: run.frameIndex,
+        stepped: file.frames, held: false, idle: false, save: null,
+        hash: arrived, records: freshRecords () });
 };
 
 self.onmessage = (event) => {
@@ -782,6 +1051,14 @@ self.onmessage = (event) => {
         // because its header is what the session is built FROM.
         replay = message.replay ? parseReplay (message.replay) : null;
 
+        // Or the recording this run starts FROM and then plays on past, which
+        // is `resume=message`'s and never beside a probe's: the block above
+        // `forward` is what it means.
+        const resume = message.resume && ! replay
+            ? parseReplay (message.resume) : null;
+
+        const file = replay || resume;
+
         // And the blob it was constructed from, which REPLACES the one the page
         // read out of its store rather than being preferred to it. A recording
         // carries what was delivered rather than a reference to where it came
@@ -792,8 +1069,8 @@ self.onmessage = (event) => {
         // make a replay of a bare recording depend on whatever this browser
         // happened to be holding for this game, which is the one thing a
         // recording exists to be independent of.
-        const saved = ! replay ? message.saved
-            : (replay.save !== null ? hexBytes (replay.save) : null);
+        const saved = ! file ? message.saved
+            : (file.save !== null ? hexBytes (file.save) : null);
 
         // A blob of the wrong length is a store this module has outgrown, and
         // the answer is the one `SaveStore` gives: `save_size` zeros, which is
@@ -807,10 +1084,31 @@ self.onmessage = (event) => {
             write: () => {},
         };
 
-        session = new Session (message.bytes, message.trampoline,
-            new HostCore (message.core),
-            replay && replay.seed !== null ? replay.seed : message.seed,
-            replay ? replay.args : message.args,
+        const rules = new HostCore (message.core);
+
+        // A recording to start from is held to what it must say before a byte
+        // of the run is built, and refused to the PAGE rather than thrown: the
+        // page is waiting on a sender who can hand it another one, and a
+        // thrown refusal would end the page's run where this one never began.
+        const unfit = resume ? resumeRefusal (resume, rules) : null;
+
+        if (unfit) {
+            self.postMessage ({ kind: 'unresumed', reason: unfit });
+
+            break;
+        }
+
+        // Every frame of the recording's messages, held to what one frame
+        // carries before a byte of the run is built, because a file naming more
+        // is one no host wrote and the run it describes cannot be played.
+        const crowded = replay ? recordedMessageRefusal (replay.messages, rules)
+            : null;
+
+        if (crowded) { refuse (crowded); }
+
+        session = new Session (message.bytes, message.trampoline, rules,
+            file && file.seed !== null ? file.seed : message.seed,
+            file ? file.args : message.args,
             message.workerUrl, message.resources, store);
 
         input = new Input ();
@@ -826,7 +1124,8 @@ self.onmessage = (event) => {
             self.postMessage ({ kind: 'note', text: `replaying `
                 + `${replay.frames} frames at seed ${replay.seed}: `
                 + `${replay.inputs.length} input lines, ${replay.taps.length} `
-                + `taps, ${replay.moves.length} pointer lines` });
+                + `taps, ${replay.moves.length} pointer lines, `
+                + `${replay.messages.length} messages` });
         }
 
         // A task becoming ready under a game whose state had no other reason to
@@ -859,7 +1158,8 @@ self.onmessage = (event) => {
         // what `construct` captured and the oldest frame a short run can show.
         ring = message.scrub === true ? openRing (session) : null;
 
-        remember (0);
+        // A resumed run's ring starts at the hand-over, in `forward`.
+        if (! resume) { remember (0); }
 
         clock = new Clock (() => session, input, (report) => {
             remember (report);
@@ -904,6 +1204,21 @@ self.onmessage = (event) => {
             save: session.renderSave (),
         });
 
+        // And the prefix, from here on this thread's own turns: the session
+        // has been built and the page told where everything is, and nothing
+        // a tick or a shed would do may touch the run until `forward` hands
+        // it over.
+        if (resume) {
+            forwarding = true;
+
+            // A throw inside the prefix - a game trapping, a refusal - is
+            // thrown again on a turn of its own, so that it reaches the page
+            // as the worker error every other throw on this thread is rather
+            // than as a rejection nothing is listening for.
+            forward (resume, message.resume).catch ((error) =>
+                setTimeout (() => { throw error; }));
+        }
+
         break;
     }
 
@@ -927,7 +1242,7 @@ self.onmessage = (event) => {
     // and `close` nulls the session, so a tick either side of a run steps
     // nothing rather than trapping.
     case 'tick':
-        if (! session) { break; }
+        if (! session || forwarding) { break; }
 
         frame (message.time);
 
@@ -952,6 +1267,22 @@ self.onmessage = (event) => {
 
         audioPort = message.port || null;
 
+        // AND A CLEAN SLATE OF WHAT THAT CONSUMER HOLDS, for the reason
+        // `viewer` below gives one channel over. The page sends this at
+        // `reset`, into a map that is already empty, and again every time it
+        // puts the sound away: it closes the audio context and builds another,
+        // whose worklet is a fresh instance on a fresh linear memory holding no
+        // resource at all. A record of what the closed one had been handed
+        // would keep every live resource from ever reaching the new one.
+        heldByAudio = new Map ();
+
+        // With a run live, the new speaker is handed the live table's
+        // resources NOW rather than on the next tick that names one, because
+        // there may be no such tick: the put-away is a halt, and what the page
+        // sounds before the run steps again is the scrub ring, whose ticks
+        // deliver nothing and are refused for any id this map lacks.
+        if (session && audioPort && session.sounds) { handOver (); }
+
         break;
 
     // And who is WATCHING: the render worker's end of a second `MessageChannel`
@@ -968,8 +1299,8 @@ self.onmessage = (event) => {
 
         screenPort = message.port || null;
 
-        // AND A CLEAN SLATE OF WHAT THAT CONSUMER HOLDS, which is the one thing
-        // this case owes that the speaker's does not. The page sends this
+        // AND A CLEAN SLATE OF WHAT THAT CONSUMER HOLDS, which the speaker's
+        // case above owes as well, for the same reason. The page sends this
         // message twice in a run's life: once at `reset`, into a map that is
         // already empty, and once when it has replaced a wedged renderer with a
         // fresh worker on a fresh linear memory. That second instance holds no
@@ -980,7 +1311,13 @@ self.onmessage = (event) => {
         // asked for, because the page cannot tell this thread what another
         // thread's memory holds and does not have to: a new port is a new
         // consumer by construction.
-        heldByScreen = new Set ();
+        heldByScreen = new Map ();
+
+        if (owedPicture && session && screenPort) {
+            owedPicture = false;
+
+            show ();
+        }
 
         break;
 
@@ -1002,6 +1339,16 @@ self.onmessage = (event) => {
 
         break;
 
+    // A message a sender posted to the page, which the page has already held to
+    // the format and admitted against what this player holds. Queued on the
+    // clock a key is queued on, so a message and a press posted together are
+    // applied at the same boundary.
+    case 'message':
+        if (input) { input.queueMessage (message.time, message.name,
+            message.value); }
+
+        break;
+
     case 'pointerbutton':
         if (input) {
             input.queuePointerButton (message.time, message.id, message.button,
@@ -1015,7 +1362,7 @@ self.onmessage = (event) => {
     // leaving as the pause begins - so it answers with one, and the page holds
     // the sound off until that answer has been published and played.
     case 'shed': {
-        if (! session) { break; }
+        if (! session || forwarding) { break; }
 
         // A REPLAYED RUN SHEDS NOTHING, because it holds nothing the browser
         // put there: the pointer leaving the canvas is a fact about a hand, and
@@ -1026,7 +1373,7 @@ self.onmessage = (event) => {
             if (message.how === 'stepped') {
                 self.postMessage ({ kind: 'frame', frame: session.frameIndex,
                     stepped: 0, held: true, idle: false, pointerAway: true,
-                    save: null, records: freshRecords () });
+                    save: null, hash: described (), records: freshRecords () });
             }
 
             break;
@@ -1067,7 +1414,7 @@ self.onmessage = (event) => {
                 input.releasePointer ();
 
                 report = session.advance (input.buttons, input.edges,
-                    input.pointer);
+                    input.pointer, input.takeMessages (session.messageRoom));
 
                 input.clearEdges ();
 
@@ -1103,6 +1450,7 @@ self.onmessage = (event) => {
                 // leaving the screen can be the input that ends a run, and a
                 // run that ends writes a fact.
                 save: (report & REPORT.save) ? session.renderSave () : null,
+                hash: described (),
                 records: freshRecords (),
             });
         }
@@ -1130,7 +1478,7 @@ self.onmessage = (event) => {
     // Nothing at all with no session or no ring: a page that did not open the
     // run with `scrub` is owed no answer, and gets none.
     case 'scrub': {
-        if (! session || ! ring) { break; }
+        if (! session || ! ring || forwarding) { break; }
 
         const floor = floorOf (), head = ring.head;
 
